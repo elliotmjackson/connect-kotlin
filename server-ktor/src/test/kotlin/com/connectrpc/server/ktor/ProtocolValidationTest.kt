@@ -104,11 +104,16 @@ class ProtocolValidationTest {
 
     /**
      * HTTP/2 cleartext (h2c) prior knowledge should be supported, since
-     * gRPC commonly runs over h2c on private networks. Currently we set
-     * `enableH2c = false` because we never validated Ktor's h2c wiring.
+     * gRPC commonly runs over h2c on private networks. Ktor Netty's
+     * `enableH2c = true` only handles the HTTP/1.1 Upgrade dance, not
+     * prior-knowledge h2c (which is what OkHttp's H2_PRIOR_KNOWLEDGE and
+     * most gRPC clients send). To make this pass we need to customize
+     * Ktor's Netty channel pipeline to install Netty's
+     * `CleartextHttp2ServerUpgradeHandler`, or switch to a different HTTP
+     * server library entirely.
      */
     @Test
-    @Ignore("TDD target: h2c (HTTP/2 cleartext) not enabled in Ktor config")
+    @Ignore("TDD target: Ktor enableH2c doesn't support prior-knowledge; needs custom Netty pipeline")
     fun h2cSupported() {
         val handler = unaryHandler { _, _ -> TestMessage("ok") }
         val registry = HandlerRegistry.builder()
