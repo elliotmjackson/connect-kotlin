@@ -20,6 +20,7 @@ dependencies {
     testImplementation(libs.assertj)
     testImplementation(libs.junit)
     testImplementation(libs.kotlin.coroutines.test)
+    testImplementation(libs.okhttp.core)
 }
 
 mavenPublishing {

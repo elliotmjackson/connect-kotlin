@@ -184,3 +184,9 @@ releaselocal: ## Release artifacts to local maven repository.
 .PHONY: test
 test: generate ## Run tests for the library.
 	./gradlew $(GRADLE_ARGS) library:test
+
+.PHONY: tddstatus
+tddstatus: ## List server TDD targets still marked @Ignore'd.
+	@grep -rn '^[[:space:]]*@Ignore(' server-ktor/src/test 2>/dev/null \
+		| sed -E 's|.*@Ignore\("([^"]*)".*|  - \1|' \
+		| sort -u
