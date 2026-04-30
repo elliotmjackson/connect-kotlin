@@ -18,7 +18,7 @@ import com.connectrpc.CODEC_NAME_JSON
 import com.connectrpc.CODEC_NAME_PROTO
 import com.connectrpc.Code
 import com.connectrpc.ConnectException
-import com.connectrpc.Headers
+import com.connectrpc.Headers as ConnectHeaders
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.server.BidiStream
@@ -37,6 +37,9 @@ import com.connectrpc.server.protocol.CONNECT_UNARY_CONTENT_TYPE_JSON
 import com.connectrpc.server.protocol.CONNECT_UNARY_CONTENT_TYPE_PROTO
 import com.connectrpc.server.protocol.ENVELOPE_FLAG_END_STREAM
 import com.connectrpc.server.protocol.ENVELOPE_FLAG_GRPC_WEB_TRAILER
+import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_BARE
+import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_JSON
+import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_PROTO
 import com.connectrpc.server.protocol.GRPC_WEB_CONTENT_TYPE_BARE
 import com.connectrpc.server.protocol.GRPC_WEB_CONTENT_TYPE_JSON
 import com.connectrpc.server.protocol.GRPC_WEB_CONTENT_TYPE_PROTO
@@ -45,18 +48,22 @@ import com.connectrpc.server.protocol.connectHttpStatus
 import com.connectrpc.server.protocol.decodeNextEnvelope
 import com.connectrpc.server.protocol.encodeEnvelope
 import com.connectrpc.server.protocol.endStreamJsonPayload
+import com.connectrpc.server.protocol.grpcTrailerPairs
 import com.connectrpc.server.protocol.grpcWebTrailerPayload
 import io.ktor.http.ContentType
+import io.ktor.http.Headers
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.content.OutgoingContent
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.contentType
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.receiveChannel
+import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
-import io.ktor.server.response.respondBytesWriter
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import okio.Buffer
@@ -84,27 +91,46 @@ fun Application.connectRpc(registry: HandlerRegistry) {
 /**
  * How a request frame is wrapped on the wire — picks trailer encoding,
  * compression header naming, and whether unary calls are framed in envelopes.
+ *
+ * If [usesHttpTrailers] is true, the protocol's trailers go into real HTTP
+ * trailing headers (gRPC over HTTP/2). Otherwise they are emitted as a
+ * final envelope on the body (Connect / gRPC-Web).
  */
 private data class StreamingProtocol(
     val trailerEnvelopeFlag: Int,
     val buildTrailerPayload: (ConnectException?, Map<String, List<String>>) -> ByteArray,
+    val buildHttpTrailers: (ConnectException?, Map<String, List<String>>) -> List<Pair<String, String>>,
     val compressionHeader: String,
-    /** gRPC-Web wraps unary too. Connect doesn't (unary uses application/proto). */
+    /** gRPC and gRPC-Web frame unary too; Connect doesn't (unary uses application/proto). */
     val framesUnary: Boolean,
+    val usesHttpTrailers: Boolean,
 )
 
 private val CONNECT_STREAMING = StreamingProtocol(
     trailerEnvelopeFlag = ENVELOPE_FLAG_END_STREAM,
     buildTrailerPayload = ::endStreamJsonPayload,
+    buildHttpTrailers = { _, _ -> emptyList() },
     compressionHeader = CONNECT_CONTENT_ENCODING_HEADER,
     framesUnary = false,
+    usesHttpTrailers = false,
 )
 
 private val GRPC_WEB_STREAMING = StreamingProtocol(
     trailerEnvelopeFlag = ENVELOPE_FLAG_GRPC_WEB_TRAILER,
     buildTrailerPayload = ::grpcWebTrailerPayload,
+    buildHttpTrailers = { _, _ -> emptyList() },
     compressionHeader = GRPC_ENCODING_HEADER,
     framesUnary = true,
+    usesHttpTrailers = false,
+)
+
+private val GRPC_STREAMING = StreamingProtocol(
+    trailerEnvelopeFlag = -1,
+    buildTrailerPayload = { _, _ -> ByteArray(0) },
+    buildHttpTrailers = ::grpcTrailerPairs,
+    compressionHeader = GRPC_ENCODING_HEADER,
+    framesUnary = true,
+    usesHttpTrailers = true,
 )
 
 private suspend fun dispatch(
@@ -120,6 +146,8 @@ private suspend fun dispatch(
         CONNECT_STREAM_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to CONNECT_STREAMING
         GRPC_WEB_CONTENT_TYPE_PROTO, GRPC_WEB_CONTENT_TYPE_BARE -> CODEC_NAME_PROTO to GRPC_WEB_STREAMING
         GRPC_WEB_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to GRPC_WEB_STREAMING
+        GRPC_CONTENT_TYPE_PROTO, GRPC_CONTENT_TYPE_BARE -> CODEC_NAME_PROTO to GRPC_STREAMING
+        GRPC_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to GRPC_STREAMING
         else -> {
             call.respondBytes(bytes = ByteArray(0), status = HttpStatusCode.UnsupportedMediaType)
             return
@@ -304,17 +332,13 @@ private suspend fun handleUnaryAsStream(
     }
 
     writeStreamResponseHeaders(call, ctx)
-    call.respondBytesWriter(
-        contentType = ContentType.parse(requestContentType),
-        status = HttpStatusCode.OK,
-    ) {
+    respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
         if (response != null) {
             val bytes = codec.codec(handler.methodSpec.responseClass)
                 .serialize(response)
                 .readByteArray()
             writeFully(encodeEnvelope(0, bytes))
         }
-        writeTrailerEnvelope(this, protocol, handlerError, ctx)
     }
 }
 
@@ -362,14 +386,10 @@ private suspend fun handleServerStream(
     }
 
     writeStreamResponseHeaders(call, ctx)
-    call.respondBytesWriter(
-        contentType = ContentType.parse(requestContentType),
-        status = HttpStatusCode.OK,
-    ) {
+    respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
         for (payload in outbound) {
             writeFully(encodeEnvelope(0, payload))
         }
-        writeTrailerEnvelope(this, protocol, handlerError, ctx)
     }
 }
 
@@ -393,15 +413,11 @@ private suspend fun handleClientStream(
     }
 
     writeStreamResponseHeaders(call, ctx)
-    call.respondBytesWriter(
-        contentType = ContentType.parse(requestContentType),
-        status = HttpStatusCode.OK,
-    ) {
+    respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
         if (response != null) {
             val bytes = codec.codec(handler.methodSpec.responseClass).serialize(response).readByteArray()
             writeFully(encodeEnvelope(0, bytes))
         }
-        writeTrailerEnvelope(this, protocol, handlerError, ctx)
     }
 }
 
@@ -431,15 +447,75 @@ private suspend fun handleBidiStream(
     }
 
     writeStreamResponseHeaders(call, ctx)
-    call.respondBytesWriter(
-        contentType = ContentType.parse(requestContentType),
-        status = HttpStatusCode.OK,
-    ) {
+    respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
         for (payload in outbound) {
             writeFully(encodeEnvelope(0, payload))
         }
-        writeTrailerEnvelope(this, protocol, handlerError, ctx)
     }
+}
+
+/**
+ * Writes the streaming response: caller-supplied body messages first, then —
+ * for envelope-trailer protocols — a trailer envelope, followed (if the
+ * protocol uses real HTTP trailers) by [StreamingProtocol.buildHttpTrailers]
+ * being surfaced through the engine.
+ */
+private suspend fun respondStreaming(
+    call: ApplicationCall,
+    requestContentType: String,
+    protocol: StreamingProtocol,
+    ctx: HandlerContext,
+    handlerError: ConnectException?,
+    writeMessages: suspend ByteWriteChannel.() -> Unit,
+) {
+    val ct = ContentType.parse(requestContentType)
+    val trailers: Headers = if (protocol.usesHttpTrailers) {
+        headersFromPairs(
+            protocol.buildHttpTrailers(handlerError, ctx.responseTrailers.mapValues { it.value.toList() }),
+        )
+    } else {
+        Headers.Empty
+    }
+    call.respond(
+        FramedStreamingContent(
+            ct = ct,
+            getTrailers = { trailers },
+            writeBody = { channel ->
+                channel.writeMessages()
+                if (!protocol.usesHttpTrailers) {
+                    channel.writeFully(
+                        encodeEnvelope(
+                            protocol.trailerEnvelopeFlag,
+                            protocol.buildTrailerPayload(
+                                handlerError,
+                                ctx.responseTrailers.mapValues { it.value.toList() },
+                            ),
+                        ),
+                    )
+                }
+            },
+        ),
+    )
+}
+
+private class FramedStreamingContent(
+    private val ct: ContentType,
+    private val getTrailers: () -> Headers,
+    private val writeBody: suspend (ByteWriteChannel) -> Unit,
+) : OutgoingContent.WriteChannelContent() {
+    override val contentType get() = ct
+    override val status get() = HttpStatusCode.OK
+    override fun trailers(): Headers = getTrailers()
+    override suspend fun writeTo(channel: ByteWriteChannel) {
+        writeBody(channel)
+    }
+}
+
+private fun headersFromPairs(pairs: List<Pair<String, String>>): Headers {
+    if (pairs.isEmpty()) return Headers.Empty
+    val builder = io.ktor.http.HeadersBuilder()
+    for ((name, value) in pairs) builder.append(name, value)
+    return builder.build()
 }
 
 /**
@@ -527,22 +603,9 @@ private suspend fun readAllRequestEnvelopes(
     return messages
 }
 
-private suspend fun writeTrailerEnvelope(
-    writer: io.ktor.utils.io.ByteWriteChannel,
-    protocol: StreamingProtocol,
-    error: ConnectException?,
-    ctx: HandlerContext,
-) {
-    val payload = protocol.buildTrailerPayload(
-        error,
-        ctx.responseTrailers.mapValues { it.value.toList() },
-    )
-    writer.writeFully(encodeEnvelope(protocol.trailerEnvelopeFlag, payload))
-}
-
 private class BufferedClientMessageStream<Req : Any>(
     messages: List<Req>,
-    override val headers: Headers,
+    override val headers: ConnectHeaders,
 ) : ClientMessageStream<Req> {
     private val iterator = messages.iterator()
     override suspend fun receive(): Req? = if (iterator.hasNext()) iterator.next() else null
@@ -550,7 +613,7 @@ private class BufferedClientMessageStream<Req : Any>(
 
 private class BufferedBidiStream<Req : Any, Res : Any>(
     messages: List<Req>,
-    override val headers: Headers,
+    override val headers: ConnectHeaders,
     private val onSend: suspend (Res) -> Unit,
 ) : BidiStream<Req, Res> {
     private val iterator = messages.iterator()
@@ -609,18 +672,28 @@ private suspend fun respondStreamError(
     exception: ConnectException,
 ) {
     if (ctx != null) writeStreamResponseHeaders(call, ctx)
-    val trailers = ctx?.responseTrailers?.mapValues { it.value.toList() } ?: emptyMap()
-    call.respondBytesWriter(
-        contentType = ContentType.parse(requestContentType),
-        status = HttpStatusCode.OK,
-    ) {
-        writeFully(
-            encodeEnvelope(
-                protocol.trailerEnvelopeFlag,
-                protocol.buildTrailerPayload(exception, trailers),
-            ),
-        )
+    val userTrailers = ctx?.responseTrailers?.mapValues { it.value.toList() } ?: emptyMap()
+    val trailers: Headers = if (protocol.usesHttpTrailers) {
+        headersFromPairs(protocol.buildHttpTrailers(exception, userTrailers))
+    } else {
+        Headers.Empty
     }
+    call.respond(
+        FramedStreamingContent(
+            ct = ContentType.parse(requestContentType),
+            getTrailers = { trailers },
+            writeBody = { channel ->
+                if (!protocol.usesHttpTrailers) {
+                    channel.writeFully(
+                        encodeEnvelope(
+                            protocol.trailerEnvelopeFlag,
+                            protocol.buildTrailerPayload(exception, userTrailers),
+                        ),
+                    )
+                }
+            },
+        ),
+    )
 }
 
 // Connect unary protocol: response headers go straight into HTTP headers;

@@ -63,7 +63,7 @@ fun grpcWebTrailerPayload(
                 .append("\r\n")
         }
         if (exception.details.isNotEmpty()) {
-            val statusBytes = encodeRpcStatus(exception)
+            val statusBytes = encodeRpcStatusInternal(exception)
             // gRPC-Web spec: -bin headers are base64 without padding.
             val b64 = okio.ByteString.of(*statusBytes).base64().trimEnd('=')
             sb.append(GRPC_HEADER_STATUS_DETAILS_BIN).append(": ").append(b64).append("\r\n")
@@ -102,7 +102,7 @@ internal fun grpcPercentEncode(value: String): String {
  *   message Status { int32 code = 1; string message = 2; repeated Any details = 3; }
  * Hand-rolled to avoid pulling the proto runtime into :server.
  */
-private fun encodeRpcStatus(exception: ConnectException): ByteArray {
+internal fun encodeRpcStatusInternal(exception: ConnectException): ByteArray {
     val out = Buffer()
     // field 1 (code), varint
     if (exception.code.value != 0) {

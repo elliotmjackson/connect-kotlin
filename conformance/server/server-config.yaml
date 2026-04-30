@@ -8,6 +8,7 @@ features:
   protocols:
     - PROTOCOL_CONNECT
     - PROTOCOL_GRPC_WEB
+    - PROTOCOL_GRPC
   codecs:
     - CODEC_PROTO
   compressions:
