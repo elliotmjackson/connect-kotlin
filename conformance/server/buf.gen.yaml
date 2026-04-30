@@ -1,0 +1,11 @@
+version: v2
+managed:
+  enabled: true
+clean: true
+plugins:
+  - protoc_builtin: java
+    protoc_path: .tmp/bin/protoc
+    out: server/build/generated/sources/bufgen
+  - protoc_builtin: kotlin
+    protoc_path: .tmp/bin/protoc
+    out: server/build/generated/sources/bufgen

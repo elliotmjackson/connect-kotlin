@@ -76,6 +76,12 @@ runconformance: generate $(CONNECT_CONFORMANCE)
 		--known-failing @conformance/client/known-failing-stream-cases.txt -- \
 		conformance/client/google-java/build/install/google-java/bin/google-java
 
+.PHONY: runserverconformance
+runserverconformance: generate $(CONNECT_CONFORMANCE) ## Run conformance tests against the Kotlin server.
+	./gradlew $(GRADLE_ARGS) conformance:server:installDist
+	$(CONNECT_CONFORMANCE) -v --mode server --conf conformance/server/server-config.yaml -- \
+		conformance/server/build/install/server/bin/server
+
 ifeq ($(UNAME_OS),Darwin)
 PROTOC_OS := osx
 ifeq ($(UNAME_ARCH),arm64)
@@ -133,6 +139,8 @@ generateconformance: $(PROTOC) buildplugin ## Generate protofiles for conformanc
 	rm -rf conformance/client/google-java/build/generated/sources/bufgen || true
 	rm -rf conformance/client/google-javalite/build/generated/sources/bufgen || true
 	buf generate --template conformance/buf.gen.yaml -o conformance/client buf.build/connectrpc/conformance:$(CONFORMANCE_VERSION)
+	rm -rf conformance/server/build/generated/sources/bufgen || true
+	buf generate --template conformance/server/buf.gen.yaml -o conformance buf.build/connectrpc/conformance:$(CONFORMANCE_VERSION)
 
 .PHONY: generateexamples
 generateexamples: $(PROTOC) buildplugin ## Generate proto files for example apps.

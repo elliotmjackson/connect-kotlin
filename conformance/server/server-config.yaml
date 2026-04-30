@@ -1,0 +1,22 @@
+# Minimum-viable server config for milestone-1.
+# Declares only what the bare server skeleton supports today.
+# As protocol implementations come online, expand this list.
+features:
+  versions:
+    - HTTP_VERSION_1
+  protocols:
+    - PROTOCOL_CONNECT
+  codecs:
+    - CODEC_PROTO
+  compressions:
+    - COMPRESSION_IDENTITY
+  streamTypes:
+    - STREAM_TYPE_UNARY
+    - STREAM_TYPE_SERVER_STREAM
+    - STREAM_TYPE_CLIENT_STREAM
+    # bidi streams require HTTP/2; not supported in milestone-1
+  supportsHalfDuplexBidiOverHttp1: false
+  supportsTls: false
+  supportsTlsClientCerts: false
+  supportsMessageReceiveLimit: false
+  supportsConnectGet: false
