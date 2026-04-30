@@ -96,6 +96,11 @@ internal fun runBlockingMain(
             request.serverCreds.cert.toByteArray(),
             request.serverCreds.key.toByteArray(),
         )
+        val clientTrustStore = if (request.clientTlsCert.isEmpty) {
+            null
+        } else {
+            buildClientTrustStore(request.clientTlsCert.toByteArray())
+        }
         embeddedServer(
             factory = Netty,
             environment = applicationEnvironment { },
@@ -108,6 +113,9 @@ internal fun runBlockingMain(
                 ) {
                     host = "127.0.0.1"
                     port = 0
+                    if (clientTrustStore != null) {
+                        trustStore = clientTrustStore
+                    }
                 }
                 enableHttp2 = wantHttp2
                 enableH2c = false

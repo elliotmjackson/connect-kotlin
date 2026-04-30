@@ -29,6 +29,22 @@ internal const val TLS_KEY_ALIAS = "server"
 internal val TLS_KEY_PASSWORD: CharArray = "changeit".toCharArray()
 
 /**
+ * Builds a trust store containing the given client CA cert(s) so that the
+ * server can validate client certificates during the TLS handshake.
+ */
+internal fun buildClientTrustStore(clientCertPem: ByteArray): KeyStore {
+    val cert = parseX509Certificate(clientCertPem)
+    return KeyStore.getInstance("PKCS12").apply {
+        load(null, null)
+        setCertificateEntry("client-ca", cert)
+    }
+}
+
+private fun parseX509Certificate(pem: ByteArray): X509Certificate =
+    CertificateFactory.getInstance("X.509")
+        .generateCertificate(ByteArrayInputStream(pem)) as X509Certificate
+
+/**
  * Builds a Java [KeyStore] containing the server's TLS cert + private key,
  * given the PEM-encoded bytes from [com.connectrpc.conformance.v1.TLSCreds].
  *
@@ -48,10 +64,6 @@ internal fun buildServerKeyStore(certPem: ByteArray, keyPem: ByteArray): KeyStor
         )
     }
 }
-
-private fun parseX509Certificate(pem: ByteArray): X509Certificate =
-    CertificateFactory.getInstance("X.509")
-        .generateCertificate(ByteArrayInputStream(pem)) as X509Certificate
 
 private fun parsePrivateKey(pem: ByteArray): PrivateKey {
     val text = String(pem, Charsets.UTF_8)

@@ -22,7 +22,7 @@ features:
     # full-duplex bidi requires HTTP/2; not supported yet
   supportsHalfDuplexBidiOverHttp1: true
   supportsTls: true
-  supportsTlsClientCerts: false
+  supportsTlsClientCerts: true
   supportsH2c: false
   supportsMessageReceiveLimit: true
   supportsConnectGet: true
