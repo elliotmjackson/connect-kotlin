@@ -57,6 +57,8 @@ import io.ktor.utils.io.writeFully
 import okio.Buffer
 
 private const val CONNECT_TIMEOUT_HEADER = "Connect-Timeout-Ms"
+private const val CONNECT_CONTENT_ENCODING_HEADER = "Connect-Content-Encoding"
+private const val IDENTITY_ENCODING = "identity"
 
 /**
  * Mounts a Connect/gRPC/gRPC-Web server into a Ktor [Application].
@@ -126,6 +128,17 @@ private suspend fun handleConnectUnary(
     val unary = handler as UnaryHandler<Any, Any>
 
     val ctx = newHandlerContext(call, procedure)
+
+    // Reject unsupported Content-Encoding (compression negotiation).
+    val contentEncoding = call.request.headers["Content-Encoding"]
+    if (contentEncoding != null && contentEncoding != IDENTITY_ENCODING) {
+        respondConnectUnaryError(
+            call,
+            ctx,
+            ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $contentEncoding"),
+        )
+        return
+    }
 
     val requestBytes = call.receiveChannel().toByteArray()
     val request = try {
@@ -346,13 +359,50 @@ private suspend fun handleServerStream(
     procedure: String,
 ) {
     val ctx = newHandlerContext(call, procedure)
+    val streamEncoding = call.request.headers[CONNECT_CONTENT_ENCODING_HEADER]
+    if (streamEncoding != null && streamEncoding != IDENTITY_ENCODING) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $streamEncoding"),
+        )
+        return
+    }
     val requestBytes = call.receiveChannel().toByteArray()
     val buffer = Buffer().write(requestBytes)
     val envelope = try {
         decodeNextEnvelope(buffer)
-            ?: throw ConnectException(Code.INVALID_ARGUMENT, "no request envelope")
+            ?: throw ConnectException(
+                Code.UNIMPLEMENTED,
+                "server-stream expects exactly one request envelope, got 0",
+            )
     } catch (ex: ConnectException) {
         respondStreamError(call, requestContentType, ctx, ex)
+        return
+    }
+    if (envelope.isCompressed) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            ConnectException(
+                Code.INTERNAL_ERROR,
+                "request envelope marked compressed but no compression negotiated",
+            ),
+        )
+        return
+    }
+    if (decodeNextEnvelope(buffer) != null) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            ConnectException(
+                Code.UNIMPLEMENTED,
+                "server-stream expects exactly one request envelope, got more",
+            ),
+        )
         return
     }
     val request = try {
