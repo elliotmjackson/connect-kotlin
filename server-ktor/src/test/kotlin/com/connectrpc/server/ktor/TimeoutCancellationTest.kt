@@ -46,8 +46,8 @@ class TimeoutCancellationTest {
      * result regardless of the elapsed time.
      */
     @Test
-    @Ignore("TDD target: Connect-Timeout-Ms is parsed but not enforced; need handler cancellation at deadline")
     fun connectTimeoutCancelsHandler() {
+        val cancelled = AtomicBoolean(false)
         val handler = object : UnaryHandler<TestMessage, TestMessage> {
             override val methodSpec = MethodSpec(
                 "test.v1.TestService/Unary",
@@ -57,8 +57,13 @@ class TimeoutCancellationTest {
             )
 
             override suspend fun handle(request: TestMessage, ctx: HandlerContext): TestMessage {
-                delay(2_000)
-                return TestMessage("late")
+                try {
+                    delay(2_000)
+                    return TestMessage("late")
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    cancelled.set(true)
+                    throw e
+                }
             }
         }
         val registry = HandlerRegistry.builder()
@@ -87,6 +92,11 @@ class TimeoutCancellationTest {
                 val body = it.body!!.string()
                 assertThat(body).contains("\"code\":\"deadline_exceeded\"")
             }
+            // Make sure the handler's coroutine actually cancelled, not just
+            // that we returned a deadline-exceeded response and let it run on.
+            assertThat(cancelled.get())
+                .describedAs("handler must observe cancellation via CancellationException")
+                .isTrue()
         }
     }
 

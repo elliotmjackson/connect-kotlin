@@ -71,6 +71,8 @@ import io.ktor.server.routing.routing
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import okio.Buffer
 
 private const val CONNECT_TIMEOUT_HEADER = "Connect-Timeout-Ms"
@@ -339,7 +341,10 @@ private suspend fun handleConnectUnary(
     }
 
     val response = try {
-        unary.handle(request, ctx)
+        invokeWithTimeout(ctx.timeoutMs) { unary.handle(request, ctx) }
+    } catch (ex: TimeoutCancellationException) {
+        respondConnectUnaryError(call, ctx, ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
+        return
     } catch (ex: ConnectException) {
         respondConnectUnaryError(call, ctx, ex)
         return
@@ -500,7 +505,9 @@ private suspend fun handleUnaryAsStream(
     }
 
     val (response, handlerError) = try {
-        handler.handle(request, ctx) to null
+        invokeWithTimeout(ctx.timeoutMs) { handler.handle(request, ctx) } to null
+    } catch (ex: TimeoutCancellationException) {
+        null to ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
     } catch (ex: ConnectException) {
         null to ex
     }
@@ -569,8 +576,10 @@ private suspend fun handleServerStream(
     }
 
     val handlerError = try {
-        handler.handle(request, ctx, outStream)
+        invokeWithTimeout(ctx.timeoutMs) { handler.handle(request, ctx, outStream) }
         null
+    } catch (ex: TimeoutCancellationException) {
+        ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
     } catch (ex: ConnectException) {
         ex
     }
@@ -599,7 +608,9 @@ private suspend fun handleClientStream(
     val inStream = BufferedClientMessageStream(messages, ctx.requestHeaders)
 
     val (response, handlerError) = try {
-        handler.handle(inStream, ctx) to null
+        invokeWithTimeout(ctx.timeoutMs) { handler.handle(inStream, ctx) } to null
+    } catch (ex: TimeoutCancellationException) {
+        null to ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
     } catch (ex: ConnectException) {
         null to ex
     }
@@ -634,8 +645,10 @@ private suspend fun handleBidiStream(
     }
 
     val handlerError = try {
-        handler.handle(bidi, ctx)
+        invokeWithTimeout(ctx.timeoutMs) { handler.handle(bidi, ctx) }
         null
+    } catch (ex: TimeoutCancellationException) {
+        ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
     } catch (ex: ConnectException) {
         ex
     }
@@ -845,6 +858,19 @@ private class BufferedBidiStream<Req : Any, Res : Any>(
     override suspend fun send(message: Res) = onSend(message)
 }
 
+/**
+ * Runs [block] under a deadline. If [timeoutMs] is null or non-positive,
+ * runs without a timeout. Throws [TimeoutCancellationException] if the
+ * deadline elapses; the block's coroutine (and any descendants) are
+ * cancelled at that point.
+ */
+private suspend inline fun <T> invokeWithTimeout(timeoutMs: Long?, crossinline block: suspend () -> T): T =
+    if (timeoutMs == null || timeoutMs <= 0) {
+        block()
+    } else {
+        withTimeout(timeoutMs) { block() }
+    }
+
 private fun newHandlerContext(
     call: ApplicationCall,
     procedure: String,
@@ -991,7 +1017,10 @@ private suspend fun dispatchConnectGet(
     val ctx = newHandlerContext(call, procedure, queryParamsAsMap(call))
 
     val response = try {
-        unary.handle(request, ctx)
+        invokeWithTimeout(ctx.timeoutMs) { unary.handle(request, ctx) }
+    } catch (ex: TimeoutCancellationException) {
+        respondConnectUnaryError(call, ctx, ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
+        return
     } catch (ex: ConnectException) {
         respondConnectUnaryError(call, ctx, ex)
         return
