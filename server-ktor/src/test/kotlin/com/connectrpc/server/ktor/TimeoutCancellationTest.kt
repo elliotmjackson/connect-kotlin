@@ -103,13 +103,23 @@ class TimeoutCancellationTest {
     /**
      * When the client closes the underlying connection mid-stream, the
      * handler's coroutine should be cancelled. We assert this via a flag
-     * the handler sets in its `finally` block.
+     * the handler sets when CancellationException fires.
      *
-     * Currently fails: nothing wires the request lifecycle to handler
-     * cancellation, so the handler runs to completion regardless.
+     * Currently fails for a stack of reasons:
+     * 1. OkHttp's `call.cancel()` cancels the local call but doesn't
+     *    necessarily close the pooled TCP connection.
+     * 2. For HTTP/1.1 mid-handler, the server can't detect disconnect
+     *    without actively reading or writing on the socket.
+     * 3. Even when Netty does fire channelInactive, Ktor's propagation
+     *    to the application coroutine is engine-specific.
+     *
+     * A proper fix likely combines: (a) a watcher coroutine that
+     * suspends on the request channel's close cause, (b) tying the
+     * handler's Job to that watcher, and (c) a test-side mechanism
+     * that forces the socket closed (e.g., raw Socket instead of OkHttp).
      */
     @Test
-    @Ignore("TDD target: client disconnect is not propagated to handler cancellation")
+    @Ignore("TDD target: needs request-channel watcher + non-OkHttp test client to force socket close")
     fun clientDisconnectCancelsHandler() {
         val cancelled = AtomicBoolean(false)
         val handler = object : UnaryHandler<TestMessage, TestMessage> {
