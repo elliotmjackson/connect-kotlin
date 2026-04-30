@@ -30,6 +30,11 @@ class HandlerContext(
     val requestHeaders: Headers,
     val httpMethod: String,
     val timeoutMs: Long?,
+    /**
+     * Query parameters from the request URL. Populated for Connect-GET requests
+     * (idempotent unary calls); null otherwise.
+     */
+    val queryParams: Map<String, List<String>>? = null,
     val responseHeaders: MutableMap<String, MutableList<String>> = mutableMapOf(),
     val responseTrailers: MutableMap<String, MutableList<String>> = mutableMapOf(),
 )

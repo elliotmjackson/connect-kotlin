@@ -21,6 +21,7 @@ import com.connectrpc.ConnectException
 import com.connectrpc.Headers as ConnectHeaders
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
+import com.connectrpc.Idempotency
 import com.connectrpc.compression.CompressionPool
 import com.connectrpc.compression.GzipCompressionPool
 import com.connectrpc.server.BidiStream
@@ -64,6 +65,7 @@ import io.ktor.server.request.httpMethod
 import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
+import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
 import io.ktor.utils.io.ByteWriteChannel
@@ -91,6 +93,12 @@ fun Application.connectRpc(registry: HandlerRegistry) {
         for (procedure in registry.procedures) {
             post("/$procedure") {
                 dispatch(call, registry, procedure)
+            }
+            val handler = registry.find(procedure)
+            if (handler != null && handler.methodSpec.idempotency == Idempotency.NO_SIDE_EFFECTS) {
+                get("/$procedure") {
+                    dispatchConnectGet(call, registry, procedure)
+                }
             }
         }
     }
@@ -668,14 +676,172 @@ private class BufferedBidiStream<Req : Any, Res : Any>(
     override suspend fun send(message: Res) = onSend(message)
 }
 
-private fun newHandlerContext(call: ApplicationCall, procedure: String) =
-    HandlerContext(
-        procedure = procedure,
-        requestHeaders = call.request.headers.toMap(),
-        httpMethod = call.request.httpMethod.value,
-        timeoutMs = call.request.headers[CONNECT_TIMEOUT_HEADER]?.toLongOrNull()
-            ?: call.request.headers[GRPC_TIMEOUT_HEADER]?.let(::parseGrpcTimeoutMs),
+private fun newHandlerContext(
+    call: ApplicationCall,
+    procedure: String,
+    queryParams: Map<String, List<String>>? = null,
+) = HandlerContext(
+    procedure = procedure,
+    requestHeaders = call.request.headers.toMap(),
+    httpMethod = call.request.httpMethod.value,
+    timeoutMs = call.request.headers[CONNECT_TIMEOUT_HEADER]?.toLongOrNull()
+        ?: call.request.headers[GRPC_TIMEOUT_HEADER]?.let(::parseGrpcTimeoutMs),
+    queryParams = queryParams,
+)
+
+/**
+ * Connect-GET dispatch for idempotent unary procedures. Parses
+ * `?connect=v1&encoding=...&message=...&base64=1&compression=...` query params.
+ */
+private suspend fun dispatchConnectGet(
+    call: ApplicationCall,
+    registry: HandlerRegistry,
+    procedure: String,
+) {
+    val handler = registry.find(procedure) as? UnaryHandler<*, *>
+    if (handler == null) {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(Code.UNIMPLEMENTED, "$procedure is not implemented"),
+        )
+        return
+    }
+
+    val params = call.request.queryParameters
+    if (params["connect"] != "v1") {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(Code.INVALID_ARGUMENT, "missing or invalid connect query param"),
+        )
+        return
+    }
+    val encoding = params["encoding"]
+    val codecName = when (encoding) {
+        CODEC_NAME_PROTO -> CODEC_NAME_PROTO
+        CODEC_NAME_JSON -> CODEC_NAME_JSON
+        else -> {
+            respondConnectUnaryError(
+                call,
+                ctx = null,
+                ConnectException(Code.INVALID_ARGUMENT, "missing or invalid encoding query param"),
+            )
+            return
+        }
+    }
+    val codec = registry.codec(codecName)
+    if (codec == null) {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(Code.UNIMPLEMENTED, "codec $codecName is not registered"),
+        )
+        return
+    }
+
+    val message = params["message"]
+    if (message == null) {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(Code.INVALID_ARGUMENT, "missing message query param"),
+        )
+        return
+    }
+    val isBase64 = params["base64"] == "1"
+    val rawBytes = try {
+        if (isBase64) {
+            // Connect spec uses URL-safe, unpadded base64 for the message.
+            java.util.Base64.getUrlDecoder().decode(message.padBase64())
+        } else {
+            message.toByteArray(Charsets.UTF_8)
+        }
+    } catch (ex: Exception) {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(Code.INVALID_ARGUMENT, "could not decode message: ${ex.message}"),
+        )
+        return
+    }
+
+    val compression = params["compression"]
+    val pool = when {
+        compression == null || compression == IDENTITY_ENCODING -> null
+        else -> COMPRESSION_POOLS[compression] ?: run {
+            respondConnectUnaryError(
+                call,
+                ctx = null,
+                ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $compression"),
+            )
+            return
+        }
+    }
+    val decompressed = if (pool != null) {
+        try {
+            pool.decompress(Buffer().write(rawBytes)).readByteArray()
+        } catch (ex: Exception) {
+            respondConnectUnaryError(
+                call,
+                ctx = null,
+                ConnectException(Code.INVALID_ARGUMENT, "could not decompress message: ${ex.message}"),
+            )
+            return
+        }
+    } else {
+        rawBytes
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    val unary = handler as UnaryHandler<Any, Any>
+    val request = try {
+        codec.codec(unary.methodSpec.requestClass).deserialize(Buffer().write(decompressed))
+    } catch (ex: Exception) {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(Code.INVALID_ARGUMENT, "could not decode request: ${ex.message}"),
+        )
+        return
+    }
+
+    val ctx = newHandlerContext(call, procedure, queryParamsAsMap(call))
+
+    val response = try {
+        unary.handle(request, ctx)
+    } catch (ex: ConnectException) {
+        respondConnectUnaryError(call, ctx, ex)
+        return
+    }
+
+    writeUnaryHeadersAndTrailers(call, ctx)
+    val responseBytes = codec.codec(unary.methodSpec.responseClass)
+        .serialize(response)
+        .readByteArray()
+    val responseContentType = "application/$codecName"
+    call.respondBytes(
+        bytes = responseBytes,
+        contentType = ContentType.parse(responseContentType),
+        status = HttpStatusCode.OK,
     )
+}
+
+private fun queryParamsAsMap(call: ApplicationCall): Map<String, List<String>> {
+    val out = mutableMapOf<String, MutableList<String>>()
+    for (name in call.request.queryParameters.names()) {
+        out[name] = call.request.queryParameters.getAll(name).orEmpty().toMutableList()
+    }
+    return out
+}
+
+/** Pads URL-safe base64 to a multiple of 4 by appending '=' chars. */
+private fun String.padBase64(): String =
+    when (length % 4) {
+        2 -> "$this=="
+        3 -> "$this="
+        else -> this
+    }
 
 /**
  * gRPC timeouts are encoded as `<digits><unit>` where unit is one of

@@ -25,4 +25,4 @@ features:
   supportsTlsClientCerts: false
   supportsH2c: false
   supportsMessageReceiveLimit: false
-  supportsConnectGet: false
+  supportsConnectGet: true

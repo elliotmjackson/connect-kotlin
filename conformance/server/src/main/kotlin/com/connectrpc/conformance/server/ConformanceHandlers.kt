@@ -139,6 +139,14 @@ private fun buildRequestInfo(
     if (t != null) {
         builder.timeoutMs = t
     }
+    val qp = ctx.queryParams
+    if (qp != null) {
+        val getInfo = ConformancePayload.ConnectGetInfo.newBuilder()
+        for ((name, values) in qp) {
+            getInfo.addQueryParams(Header.newBuilder().setName(name).addAllValue(values))
+        }
+        builder.connectGetInfo = getInfo.build()
+    }
     return builder.build()
 }
 
