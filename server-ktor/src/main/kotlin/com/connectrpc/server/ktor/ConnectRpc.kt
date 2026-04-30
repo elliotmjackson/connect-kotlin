@@ -21,6 +21,8 @@ import com.connectrpc.ConnectException
 import com.connectrpc.Headers as ConnectHeaders
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
+import com.connectrpc.compression.CompressionPool
+import com.connectrpc.compression.GzipCompressionPool
 import com.connectrpc.server.BidiStream
 import com.connectrpc.server.BidiStreamHandler
 import com.connectrpc.server.ClientMessageStream
@@ -35,6 +37,7 @@ import com.connectrpc.server.protocol.CONNECT_STREAM_CONTENT_TYPE_JSON
 import com.connectrpc.server.protocol.CONNECT_STREAM_CONTENT_TYPE_PROTO
 import com.connectrpc.server.protocol.CONNECT_UNARY_CONTENT_TYPE_JSON
 import com.connectrpc.server.protocol.CONNECT_UNARY_CONTENT_TYPE_PROTO
+import com.connectrpc.server.protocol.ENVELOPE_FLAG_COMPRESSED
 import com.connectrpc.server.protocol.ENVELOPE_FLAG_END_STREAM
 import com.connectrpc.server.protocol.ENVELOPE_FLAG_GRPC_WEB_TRAILER
 import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_BARE
@@ -73,6 +76,11 @@ private const val GRPC_TIMEOUT_HEADER = "Grpc-Timeout"
 private const val CONNECT_CONTENT_ENCODING_HEADER = "Connect-Content-Encoding"
 private const val GRPC_ENCODING_HEADER = "Grpc-Encoding"
 private const val IDENTITY_ENCODING = "identity"
+
+/** Compression algorithms recognized server-side. Always includes identity. */
+private val COMPRESSION_POOLS: Map<String, CompressionPool> = mapOf(
+    GzipCompressionPool.name() to GzipCompressionPool,
+)
 
 /**
  * Mounts a Connect/gRPC-Web server into a Ktor [Application]. gRPC over HTTP/2
@@ -191,16 +199,33 @@ private suspend fun handleConnectUnary(
     val ctx = newHandlerContext(call, procedure)
 
     val contentEncoding = call.request.headers["Content-Encoding"]
-    if (contentEncoding != null && contentEncoding != IDENTITY_ENCODING) {
-        respondConnectUnaryError(
-            call,
-            ctx,
-            ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $contentEncoding"),
-        )
-        return
+    val requestPool: CompressionPool? = when {
+        contentEncoding == null || contentEncoding == IDENTITY_ENCODING -> null
+        else -> COMPRESSION_POOLS[contentEncoding] ?: run {
+            respondConnectUnaryError(
+                call,
+                ctx,
+                ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $contentEncoding"),
+            )
+            return
+        }
     }
 
-    val requestBytes = call.receiveChannel().toByteArray()
+    val rawBytes = call.receiveChannel().toByteArray()
+    val requestBytes = if (requestPool != null) {
+        try {
+            requestPool.decompress(Buffer().write(rawBytes)).readByteArray()
+        } catch (ex: Exception) {
+            respondConnectUnaryError(
+                call,
+                ctx,
+                ConnectException(Code.INVALID_ARGUMENT, "could not decompress request: ${ex.message}"),
+            )
+            return
+        }
+    } else {
+        rawBytes
+    }
     val request = try {
         codec.codec(unary.methodSpec.requestClass).deserialize(Buffer().write(requestBytes))
     } catch (ex: Exception) {
@@ -250,15 +275,18 @@ private suspend fun handleStreaming(
     val ctx = newHandlerContext(call, procedure)
 
     val streamEncoding = call.request.headers[protocol.compressionHeader]
-    if (streamEncoding != null && streamEncoding != IDENTITY_ENCODING) {
-        respondStreamError(
-            call,
-            requestContentType,
-            ctx,
-            protocol,
-            ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $streamEncoding"),
-        )
-        return
+    val streamPool: CompressionPool? = when {
+        streamEncoding == null || streamEncoding == IDENTITY_ENCODING -> null
+        else -> COMPRESSION_POOLS[streamEncoding] ?: run {
+            respondStreamError(
+                call,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $streamEncoding"),
+            )
+            return
+        }
     }
 
     when (handler.methodSpec.streamType) {
@@ -278,22 +306,22 @@ private suspend fun handleStreaming(
             }
             @Suppress("UNCHECKED_CAST")
             val uh = handler as UnaryHandler<Any, Any>
-            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol)
+            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool)
         }
         StreamType.SERVER -> {
             @Suppress("UNCHECKED_CAST")
             val sh = handler as ServerStreamHandler<Any, Any>
-            handleServerStream(call, sh, ctx, codec, requestContentType, protocol)
+            handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool)
         }
         StreamType.CLIENT -> {
             @Suppress("UNCHECKED_CAST")
             val ch = handler as ClientStreamHandler<Any, Any>
-            handleClientStream(call, ch, ctx, codec, requestContentType, protocol)
+            handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool)
         }
         StreamType.BIDI -> {
             @Suppress("UNCHECKED_CAST")
             val bh = handler as BidiStreamHandler<Any, Any>
-            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol)
+            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool)
         }
     }
 }
@@ -305,8 +333,9 @@ private suspend fun handleUnaryAsStream(
     codec: SerializationStrategy,
     requestContentType: String,
     protocol: StreamingProtocol,
+    pool: CompressionPool?,
 ) {
-    val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol)
+    val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol, pool)
         ?: return
     if (error != null) {
         respondStreamError(call, requestContentType, ctx, protocol, error)
@@ -349,8 +378,9 @@ private suspend fun handleServerStream(
     codec: SerializationStrategy,
     requestContentType: String,
     protocol: StreamingProtocol,
+    pool: CompressionPool?,
 ) {
-    val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol)
+    val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol, pool)
         ?: return
     if (error != null) {
         respondStreamError(call, requestContentType, ctx, protocol, error)
@@ -400,8 +430,9 @@ private suspend fun handleClientStream(
     codec: SerializationStrategy,
     requestContentType: String,
     protocol: StreamingProtocol,
+    pool: CompressionPool?,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol)
+    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool)
         ?: return
 
     val inStream = BufferedClientMessageStream(messages, ctx.requestHeaders)
@@ -428,8 +459,9 @@ private suspend fun handleBidiStream(
     codec: SerializationStrategy,
     requestContentType: String,
     protocol: StreamingProtocol,
+    pool: CompressionPool?,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol)
+    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool)
         ?: return
 
     val outbound = mutableListOf<ByteArray>()
@@ -528,6 +560,7 @@ private suspend fun readSingleStreamEnvelope(
     @Suppress("UNUSED_PARAMETER") requestContentType: String,
     @Suppress("UNUSED_PARAMETER") ctx: HandlerContext,
     @Suppress("UNUSED_PARAMETER") protocol: StreamingProtocol,
+    pool: CompressionPool?,
 ): Pair<com.connectrpc.server.protocol.ConnectEnvelope, ConnectException?>? {
     val requestBytes = call.receiveChannel().toByteArray()
     val buffer = Buffer().write(requestBytes)
@@ -540,19 +573,31 @@ private suspend fun readSingleStreamEnvelope(
     } catch (ex: ConnectException) {
         return DUMMY_ENVELOPE to ex
     }
-    if (envelope.isCompressed) {
-        return DUMMY_ENVELOPE to ConnectException(
-            Code.INTERNAL_ERROR,
-            "request envelope marked compressed but no compression negotiated",
-        )
-    }
     if (decodeNextEnvelope(buffer) != null) {
         return DUMMY_ENVELOPE to ConnectException(
             Code.UNIMPLEMENTED,
             "expects exactly one request envelope, got more",
         )
     }
-    return envelope to null
+    val decoded = decompressEnvelopeIfNeeded(envelope, pool)
+        ?: return DUMMY_ENVELOPE to ConnectException(
+            Code.INTERNAL_ERROR,
+            "request envelope marked compressed but no compression negotiated",
+        )
+    return decoded to null
+}
+
+private fun decompressEnvelopeIfNeeded(
+    envelope: com.connectrpc.server.protocol.ConnectEnvelope,
+    pool: CompressionPool?,
+): com.connectrpc.server.protocol.ConnectEnvelope? {
+    if (!envelope.isCompressed) return envelope
+    if (pool == null) return null
+    val decompressed = pool.decompress(Buffer().write(envelope.payload)).readByteArray()
+    return com.connectrpc.server.protocol.ConnectEnvelope(
+        flags = envelope.flags and ENVELOPE_FLAG_COMPRESSED.inv(),
+        payload = decompressed,
+    )
 }
 
 private val DUMMY_ENVELOPE = com.connectrpc.server.protocol.ConnectEnvelope(0, ByteArray(0))
@@ -564,6 +609,7 @@ private suspend fun readAllRequestEnvelopes(
     ctx: HandlerContext,
     requestContentType: String,
     protocol: StreamingProtocol,
+    pool: CompressionPool?,
 ): List<Any>? {
     val requestBytes = call.receiveChannel().toByteArray()
     val buffer = Buffer().write(requestBytes)
@@ -572,20 +618,21 @@ private suspend fun readAllRequestEnvelopes(
     try {
         while (true) {
             val env = decodeNextEnvelope(buffer) ?: break
-            if (env.isCompressed) {
-                respondStreamError(
-                    call,
-                    requestContentType,
-                    ctx,
-                    protocol,
-                    ConnectException(
-                        Code.INTERNAL_ERROR,
-                        "request envelope marked compressed but no compression negotiated",
-                    ),
-                )
-                return null
-            }
-            messages += msgCodec.deserialize(Buffer().write(env.payload))
+            val decoded = decompressEnvelopeIfNeeded(env, pool)
+                ?: run {
+                    respondStreamError(
+                        call,
+                        requestContentType,
+                        ctx,
+                        protocol,
+                        ConnectException(
+                            Code.INTERNAL_ERROR,
+                            "request envelope marked compressed but no compression negotiated",
+                        ),
+                    )
+                    return null
+                }
+            messages += msgCodec.deserialize(Buffer().write(decoded.payload))
         }
     } catch (ex: ConnectException) {
         respondStreamError(call, requestContentType, ctx, protocol, ex)
