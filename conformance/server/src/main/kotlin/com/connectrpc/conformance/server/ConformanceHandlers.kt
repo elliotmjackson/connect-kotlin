@@ -22,6 +22,8 @@ import com.connectrpc.ErrorDetailParser
 import com.connectrpc.Idempotency
 import com.connectrpc.MethodSpec
 import com.connectrpc.StreamType
+import com.connectrpc.conformance.v1.ClientStreamRequest
+import com.connectrpc.conformance.v1.ClientStreamResponse
 import com.connectrpc.conformance.v1.ConformancePayload
 import com.connectrpc.conformance.v1.Header
 import com.connectrpc.conformance.v1.IdempotentUnaryRequest
@@ -32,6 +34,8 @@ import com.connectrpc.conformance.v1.StreamResponseDefinition
 import com.connectrpc.conformance.v1.UnaryRequest
 import com.connectrpc.conformance.v1.UnaryResponse
 import com.connectrpc.conformance.v1.UnaryResponseDefinition
+import com.connectrpc.server.ClientMessageStream
+import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.ServerMessageStream
 import com.connectrpc.server.ServerStreamHandler
@@ -189,6 +193,66 @@ internal class ConformanceServerStreamHandler :
             throw ConnectException(code = code, message = message)
                 .withErrorDetails(NoopErrorDetailParser, details)
         }
+    }
+}
+
+internal class ConformanceClientStreamHandler :
+    ClientStreamHandler<ClientStreamRequest, ClientStreamResponse> {
+    override val methodSpec = MethodSpec(
+        "$SERVICE_PATH/ClientStream",
+        ClientStreamRequest::class,
+        ClientStreamResponse::class,
+        StreamType.CLIENT,
+    )
+
+    override suspend fun handle(
+        stream: ClientMessageStream<ClientStreamRequest>,
+        ctx: HandlerContext,
+    ): ClientStreamResponse {
+        val received = mutableListOf<ClientStreamRequest>()
+        var def: UnaryResponseDefinition? = null
+        while (true) {
+            val msg = stream.receive() ?: break
+            if (received.isEmpty() && msg.hasResponseDefinition()) {
+                def = msg.responseDefinition
+            }
+            received += msg
+        }
+
+        val requestInfo = buildRequestInfo(ctx, received.map { packAny(it) })
+        val payloadBuilder = ConformancePayload.newBuilder().setRequestInfo(requestInfo)
+
+        if (def == null) {
+            return ClientStreamResponse.newBuilder().setPayload(payloadBuilder.build()).build()
+        }
+
+        for (h in def.responseHeadersList) {
+            ctx.responseHeaders.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+        }
+        for (h in def.responseTrailersList) {
+            ctx.responseTrailers.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+        }
+
+        if (def.responseDelayMs > 0) {
+            delay(def.responseDelayMs.toLong())
+        }
+
+        if (def.hasError()) {
+            val err = def.error
+            val code = Code.fromValue(err.code.number) ?: Code.UNKNOWN
+            val message = if (err.hasMessage()) err.message else null
+            val details = mutableListOf<ConnectErrorDetail>()
+            details += packAny(requestInfo).toConnectErrorDetail()
+            for (d in err.detailsList) {
+                details += d.toConnectErrorDetail()
+            }
+            throw ConnectException(code = code, message = message)
+                .withErrorDetails(NoopErrorDetailParser, details)
+        }
+
+        return ClientStreamResponse.newBuilder()
+            .setPayload(payloadBuilder.setData(def.responseData).build())
+            .build()
     }
 }
 

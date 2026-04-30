@@ -20,6 +20,9 @@ import com.connectrpc.Code
 import com.connectrpc.ConnectException
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
+import com.connectrpc.Headers
+import com.connectrpc.server.ClientMessageStream
+import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
 import com.connectrpc.server.ServerMessageStream
@@ -173,6 +176,11 @@ private suspend fun handleConnectStream(
             val sh = handler as ServerStreamHandler<Any, Any>
             handleServerStream(call, sh, codec, requestContentType, procedure)
         }
+        StreamType.CLIENT -> {
+            @Suppress("UNCHECKED_CAST")
+            val ch = handler as ClientStreamHandler<Any, Any>
+            handleClientStream(call, ch, codec, requestContentType, procedure)
+        }
         else -> respondStreamError(
             call,
             requestContentType,
@@ -183,6 +191,71 @@ private suspend fun handleConnectStream(
             ),
         )
     }
+}
+
+private suspend fun handleClientStream(
+    call: ApplicationCall,
+    handler: ClientStreamHandler<Any, Any>,
+    codec: SerializationStrategy,
+    requestContentType: String,
+    procedure: String,
+) {
+    val ctx = newHandlerContext(call, procedure)
+    val requestBytes = call.receiveChannel().toByteArray()
+    val buffer = Buffer().write(requestBytes)
+    val messages = mutableListOf<Any>()
+    val msgCodec = codec.codec(handler.methodSpec.requestClass)
+    try {
+        while (true) {
+            val env = decodeNextEnvelope(buffer) ?: break
+            messages += msgCodec.deserialize(Buffer().write(env.payload))
+        }
+    } catch (ex: ConnectException) {
+        respondStreamError(call, requestContentType, ctx, ex)
+        return
+    } catch (ex: Exception) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            ConnectException(Code.INVALID_ARGUMENT, "could not decode request: ${ex.message}"),
+        )
+        return
+    }
+
+    val inStream = BufferedClientMessageStream(messages, ctx.requestHeaders)
+
+    val (response, handlerError) = try {
+        handler.handle(inStream, ctx) to null
+    } catch (ex: ConnectException) {
+        null to ex
+    }
+
+    writeStreamResponseHeaders(call, ctx)
+    call.respondBytesWriter(
+        contentType = ContentType.parse(requestContentType),
+        status = HttpStatusCode.OK,
+    ) {
+        if (response != null) {
+            val responseBytes =
+                codec.codec(handler.methodSpec.responseClass).serialize(response).readByteArray()
+            writeFully(encodeEnvelope(0, responseBytes))
+        }
+        writeFully(
+            encodeEnvelope(
+                ENVELOPE_FLAG_END_STREAM,
+                endStreamJsonPayload(handlerError, ctx.responseTrailers.mapValues { it.value.toList() }),
+            ),
+        )
+    }
+}
+
+private class BufferedClientMessageStream<Req : Any>(
+    messages: List<Req>,
+    override val headers: Headers,
+) : ClientMessageStream<Req> {
+    private val iterator = messages.iterator()
+    override suspend fun receive(): Req? = if (iterator.hasNext()) iterator.next() else null
 }
 
 private suspend fun handleServerStream(

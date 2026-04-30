@@ -108,13 +108,7 @@ private fun buildConformanceRegistry(): HandlerRegistry =
         .codec(GoogleJavaJSONStrategy())
         .register(ConformanceUnaryHandler())
         .register(ConformanceServerStreamHandler())
-        .register(
-            unimplementedClientStream(
-                "$SERVICE_PATH/ClientStream",
-                ClientStreamRequest::class,
-                ClientStreamResponse::class,
-            ),
-        )
+        .register(ConformanceClientStreamHandler())
         .register(
             unimplementedBidi(
                 "$SERVICE_PATH/BidiStream",
