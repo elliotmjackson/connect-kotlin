@@ -57,6 +57,14 @@ class HandlerRegistry private constructor(
         }
 
         /**
+         * Registers all handlers in the iterable. Useful with the generated
+         * `<Service>Handler.handlers()` helper from protoc-gen-connect-kotlin.
+         */
+        fun registerAll(handlers: Iterable<Handler<*, *>>): Builder = apply {
+            for (h in handlers) register(h)
+        }
+
+        /**
          * Adds a codec available for content-type negotiation. At least one codec
          * must be registered before [build].
          */

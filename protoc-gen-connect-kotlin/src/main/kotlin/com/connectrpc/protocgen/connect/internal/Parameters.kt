@@ -17,6 +17,7 @@ package com.connectrpc.protocgen.connect.internal
 internal const val CALLBACK_SIGNATURE = "generateCallbackMethods"
 internal const val COROUTINE_SIGNATURE = "generateCoroutineMethods"
 internal const val BLOCKING_UNARY_SIGNATURE = "generateBlockingUnaryMethods"
+internal const val SERVER_HANDLER_SIGNATURE = "generateServerHandler"
 
 /**
  * The protoc plugin configuration class representation.
@@ -28,6 +29,9 @@ internal data class Configuration(
     val generateCoroutineMethods: Boolean,
     // Enable or disable blocking unary signature generation.
     val generateBlockingUnaryMethods: Boolean,
+    // Enable or disable server handler abstract base class generation.
+    // Off by default to avoid pulling :server onto client-only consumers.
+    val generateServerHandler: Boolean,
 )
 
 /**
@@ -45,5 +49,6 @@ internal fun parse(input: String): Configuration {
         // Defaulted to true.
         generateCoroutineMethods = parameters[COROUTINE_SIGNATURE]?.toBoolean() ?: true,
         generateBlockingUnaryMethods = parameters[BLOCKING_UNARY_SIGNATURE]?.toBoolean() ?: false,
+        generateServerHandler = parameters[SERVER_HANDLER_SIGNATURE]?.toBoolean() ?: false,
     )
 }

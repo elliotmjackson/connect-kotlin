@@ -14,34 +14,10 @@
 
 package com.connectrpc.conformance.server
 
-import com.connectrpc.Code
-import com.connectrpc.ConnectException
-import com.connectrpc.MethodSpec
-import com.connectrpc.StreamType
-import com.connectrpc.conformance.v1.BidiStreamRequest
-import com.connectrpc.conformance.v1.BidiStreamResponse
-import com.connectrpc.conformance.v1.ClientStreamRequest
-import com.connectrpc.conformance.v1.ClientStreamResponse
 import com.connectrpc.conformance.v1.HTTPVersion
-import com.connectrpc.conformance.v1.IdempotentUnaryRequest
-import com.connectrpc.conformance.v1.IdempotentUnaryResponse
 import com.connectrpc.conformance.v1.ServerCompatRequest
 import com.connectrpc.conformance.v1.ServerCompatResponse
-import com.connectrpc.conformance.v1.ServerStreamRequest
-import com.connectrpc.conformance.v1.ServerStreamResponse
-import com.connectrpc.conformance.v1.UnaryRequest
-import com.connectrpc.conformance.v1.UnaryResponse
-import com.connectrpc.conformance.v1.UnimplementedRequest
-import com.connectrpc.conformance.v1.UnimplementedResponse
-import com.connectrpc.server.BidiStream
-import com.connectrpc.server.BidiStreamHandler
-import com.connectrpc.server.ClientMessageStream
-import com.connectrpc.server.ClientStreamHandler
-import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
-import com.connectrpc.server.ServerMessageStream
-import com.connectrpc.server.ServerStreamHandler
-import com.connectrpc.server.UnaryHandler
 import com.connectrpc.extensions.GoogleJavaJSONStrategy
 import com.connectrpc.extensions.GoogleJavaProtobufStrategy
 import com.connectrpc.server.ktor.connectRpc
@@ -55,8 +31,6 @@ import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
 import kotlin.system.exitProcess
-
-internal const val SERVICE_PATH = "connectrpc.conformance.v1.ConformanceService"
 
 fun main(args: Array<String>) {
     runBlockingMain(args, System.`in`, System.out)
@@ -157,68 +131,8 @@ private fun buildConformanceRegistry(): HandlerRegistry =
     HandlerRegistry.builder()
         .codec(GoogleJavaProtobufStrategy())
         .codec(GoogleJavaJSONStrategy())
-        .register(ConformanceUnaryHandler())
-        .register(ConformanceServerStreamHandler())
-        .register(ConformanceClientStreamHandler())
-        .register(ConformanceBidiStreamHandler())
-        .register(
-            unimplemented(
-                "$SERVICE_PATH/Unimplemented",
-                StreamType.UNARY,
-                UnimplementedRequest::class,
-                UnimplementedResponse::class,
-            ),
-        )
-        .register(ConformanceIdempotentUnaryHandler())
+        .registerAll(ConformanceServiceImpl().handlers())
         .build()
-
-private fun <Req : Any, Res : Any> unimplemented(
-    path: String,
-    streamType: StreamType,
-    reqClass: kotlin.reflect.KClass<Req>,
-    resClass: kotlin.reflect.KClass<Res>,
-): UnaryHandler<Req, Res> = object : UnaryHandler<Req, Res> {
-    override val methodSpec = MethodSpec(path, reqClass, resClass, streamType)
-    override suspend fun handle(request: Req, ctx: HandlerContext): Res =
-        throw ConnectException(Code.UNIMPLEMENTED, "$path is not implemented")
-}
-
-private fun <Req : Any, Res : Any> unimplementedServerStream(
-    path: String,
-    reqClass: kotlin.reflect.KClass<Req>,
-    resClass: kotlin.reflect.KClass<Res>,
-): ServerStreamHandler<Req, Res> = object : ServerStreamHandler<Req, Res> {
-    override val methodSpec = MethodSpec(path, reqClass, resClass, StreamType.SERVER)
-    override suspend fun handle(
-        request: Req,
-        ctx: HandlerContext,
-        stream: ServerMessageStream<Res>,
-    ) = throw ConnectException(Code.UNIMPLEMENTED, "$path is not implemented")
-}
-
-private fun <Req : Any, Res : Any> unimplementedClientStream(
-    path: String,
-    reqClass: kotlin.reflect.KClass<Req>,
-    resClass: kotlin.reflect.KClass<Res>,
-): ClientStreamHandler<Req, Res> = object : ClientStreamHandler<Req, Res> {
-    override val methodSpec = MethodSpec(path, reqClass, resClass, StreamType.CLIENT)
-    override suspend fun handle(
-        stream: ClientMessageStream<Req>,
-        ctx: HandlerContext,
-    ): Res = throw ConnectException(Code.UNIMPLEMENTED, "$path is not implemented")
-}
-
-private fun <Req : Any, Res : Any> unimplementedBidi(
-    path: String,
-    reqClass: kotlin.reflect.KClass<Req>,
-    resClass: kotlin.reflect.KClass<Res>,
-): BidiStreamHandler<Req, Res> = object : BidiStreamHandler<Req, Res> {
-    override val methodSpec = MethodSpec(path, reqClass, resClass, StreamType.BIDI)
-    override suspend fun handle(
-        stream: BidiStream<Req, Res>,
-        ctx: HandlerContext,
-    ) = throw ConnectException(Code.UNIMPLEMENTED, "$path is not implemented")
-}
 
 private fun readServerCompatRequest(input: InputStream): ServerCompatRequest {
     val len = input.readBigEndianInt()

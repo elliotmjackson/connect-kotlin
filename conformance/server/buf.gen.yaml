@@ -9,3 +9,8 @@ plugins:
   - protoc_builtin: kotlin
     protoc_path: .tmp/bin/protoc
     out: server/build/generated/sources/bufgen
+  - local: ./protoc-gen-connect-kotlin/build/install/protoc-gen-connect-kotlin/bin/protoc-gen-connect-kotlin
+    out: server/build/generated/sources/bufgen
+    opt:
+      - generateServerHandler=true
+      - generateCoroutineMethods=false
