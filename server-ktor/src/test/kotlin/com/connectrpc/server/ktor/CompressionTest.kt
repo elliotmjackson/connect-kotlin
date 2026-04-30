@@ -39,7 +39,6 @@ class CompressionTest {
      * outgoing responses (always identity).
      */
     @Test
-    @Ignore("TDD target: server never compresses outbound responses; need Accept-Encoding negotiation")
     fun outboundGzipCompression() {
         val largePayload = ByteArray(64_000) { (it % 256).toByte() }
         val handler = object : UnaryHandler<TestMessage, TestMessage> {

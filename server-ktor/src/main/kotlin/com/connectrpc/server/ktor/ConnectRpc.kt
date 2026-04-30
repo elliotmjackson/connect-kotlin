@@ -105,21 +105,39 @@ fun Application.connectRpc(
      * Mirrors connect-go's `RequireConnectProtocolHeader` handler option.
      */
     requireConnectProtocolHeader: Boolean = false,
+    /**
+     * Responses whose serialized message size meets or exceeds this threshold
+     * are eligible for compression when the client advertises a supported
+     * encoding via Accept-Encoding (or the protocol's streaming equivalent).
+     * Set to [Int.MAX_VALUE] to disable outbound compression.
+     */
+    compressMinBytes: Int = 1024,
 ) {
+    val opts = ConnectRpcOptions(
+        maxReceiveMessageSize = maxReceiveMessageSize,
+        requireConnectProtocolHeader = requireConnectProtocolHeader,
+        compressMinBytes = compressMinBytes,
+    )
     routing {
         for (procedure in registry.procedures) {
             post("/$procedure") {
-                dispatch(call, registry, procedure, maxReceiveMessageSize, requireConnectProtocolHeader)
+                dispatch(call, registry, procedure, opts)
             }
             val handler = registry.find(procedure)
             if (handler != null && handler.methodSpec.idempotency == Idempotency.NO_SIDE_EFFECTS) {
                 get("/$procedure") {
-                    dispatchConnectGet(call, registry, procedure, maxReceiveMessageSize)
+                    dispatchConnectGet(call, registry, procedure, opts)
                 }
             }
         }
     }
 }
+
+private data class ConnectRpcOptions(
+    val maxReceiveMessageSize: Int,
+    val requireConnectProtocolHeader: Boolean,
+    val compressMinBytes: Int,
+)
 
 /**
  * How a request frame is wrapped on the wire — picks trailer encoding,
@@ -170,9 +188,10 @@ private suspend fun dispatch(
     call: ApplicationCall,
     registry: HandlerRegistry,
     procedure: String,
-    maxReceiveMessageSize: Int,
-    requireConnectProtocolHeader: Boolean,
+    opts: ConnectRpcOptions,
 ) {
+    val maxReceiveMessageSize = opts.maxReceiveMessageSize
+    val requireConnectProtocolHeader = opts.requireConnectProtocolHeader
     val contentType = call.request.contentType().withoutParameters().toString()
     val (codecName, protocol) = when (contentType) {
         CONNECT_UNARY_CONTENT_TYPE_PROTO -> CODEC_NAME_PROTO to null
@@ -240,9 +259,9 @@ private suspend fun dispatch(
     }
 
     if (protocol == null) {
-        handleConnectUnary(call, registry, procedure, codec, contentType, maxReceiveMessageSize)
+        handleConnectUnary(call, registry, procedure, codec, contentType, opts)
     } else {
-        handleStreaming(call, registry, procedure, codec, contentType, protocol, maxReceiveMessageSize)
+        handleStreaming(call, registry, procedure, codec, contentType, protocol, opts)
     }
 }
 
@@ -252,8 +271,9 @@ private suspend fun handleConnectUnary(
     procedure: String,
     codec: SerializationStrategy,
     requestContentType: String,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
+    val maxReceiveMessageSize = opts.maxReceiveMessageSize
     val handler = registry.find(procedure)
     if (handler == null || handler.methodSpec.streamType != StreamType.UNARY) {
         respondConnectUnaryError(
@@ -326,12 +346,40 @@ private suspend fun handleConnectUnary(
     }
 
     writeUnaryHeadersAndTrailers(call, ctx)
-    val responseBytes = codec.codec(unary.methodSpec.responseClass).serialize(response).readByteArray()
+    val rawResponseBytes = codec.codec(unary.methodSpec.responseClass).serialize(response).readByteArray()
+    val (finalBytes, encoding) = maybeCompressOutbound(
+        rawResponseBytes,
+        acceptEncoding = call.request.headers["Accept-Encoding"],
+        compressMinBytes = opts.compressMinBytes,
+    )
+    if (encoding != null) {
+        call.response.headers.append("Content-Encoding", encoding, safeOnly = false)
+    }
     call.respondBytes(
-        bytes = responseBytes,
+        bytes = finalBytes,
         contentType = ContentType.parse(requestContentType),
         status = HttpStatusCode.OK,
     )
+}
+
+/**
+ * Picks an outbound encoding from [acceptEncoding] (a comma-separated list)
+ * and compresses [bytes] if the chosen pool reduces size meaningfully and
+ * the input meets the [compressMinBytes] threshold. Returns the final body
+ * bytes plus the encoding name (or null for identity).
+ */
+private fun maybeCompressOutbound(
+    bytes: ByteArray,
+    acceptEncoding: String?,
+    compressMinBytes: Int,
+): Pair<ByteArray, String?> {
+    if (acceptEncoding == null || bytes.size < compressMinBytes) return bytes to null
+    val accepted = acceptEncoding.split(',')
+        .map { it.substringBefore(';').trim().lowercase() }
+        .filter { it.isNotEmpty() }
+    val pool = accepted.firstNotNullOfOrNull { COMPRESSION_POOLS[it] } ?: return bytes to null
+    val compressed = pool.compress(Buffer().write(bytes)).readByteArray()
+    return compressed to pool.name()
 }
 
 private suspend fun handleStreaming(
@@ -341,7 +389,7 @@ private suspend fun handleStreaming(
     codec: SerializationStrategy,
     requestContentType: String,
     protocol: StreamingProtocol,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
     val handler = registry.find(procedure)
     if (handler == null) {
@@ -388,22 +436,22 @@ private suspend fun handleStreaming(
             }
             @Suppress("UNCHECKED_CAST")
             val uh = handler as UnaryHandler<Any, Any>
-            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
+            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.SERVER -> {
             @Suppress("UNCHECKED_CAST")
             val sh = handler as ServerStreamHandler<Any, Any>
-            handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
+            handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.CLIENT -> {
             @Suppress("UNCHECKED_CAST")
             val ch = handler as ClientStreamHandler<Any, Any>
-            handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
+            handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.BIDI -> {
             @Suppress("UNCHECKED_CAST")
             val bh = handler as BidiStreamHandler<Any, Any>
-            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
+            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
     }
 }
@@ -416,8 +464,9 @@ private suspend fun handleUnaryAsStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
+    val maxReceiveMessageSize = opts.maxReceiveMessageSize
     val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol, pool)
         ?: return
     if (error != null) {
@@ -475,8 +524,9 @@ private suspend fun handleServerStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
+    val maxReceiveMessageSize = opts.maxReceiveMessageSize
     val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol, pool)
         ?: return
     if (error != null) {
@@ -541,9 +591,9 @@ private suspend fun handleClientStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, maxReceiveMessageSize)
+    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, opts.maxReceiveMessageSize)
         ?: return
 
     val inStream = BufferedClientMessageStream(messages, ctx.requestHeaders)
@@ -571,9 +621,9 @@ private suspend fun handleBidiStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, maxReceiveMessageSize)
+    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, opts.maxReceiveMessageSize)
         ?: return
 
     val outbound = mutableListOf<ByteArray>()
@@ -816,8 +866,9 @@ private suspend fun dispatchConnectGet(
     call: ApplicationCall,
     registry: HandlerRegistry,
     procedure: String,
-    maxReceiveMessageSize: Int,
+    opts: ConnectRpcOptions,
 ) {
+    val maxReceiveMessageSize = opts.maxReceiveMessageSize
     val handler = registry.find(procedure) as? UnaryHandler<*, *>
     if (handler == null) {
         respondConnectUnaryError(
