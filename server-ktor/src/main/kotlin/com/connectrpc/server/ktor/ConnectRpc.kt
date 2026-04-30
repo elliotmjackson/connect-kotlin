@@ -68,7 +68,10 @@ import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.ByteReadChannel
 import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.readByte
+import io.ktor.utils.io.readByteArray
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.CompletableDeferred
@@ -676,32 +679,116 @@ private suspend fun handleBidiStream(
     pool: CompressionPool?,
     opts: ConnectRpcOptions,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, opts.maxReceiveMessageSize)
-        ?: return
+    // Real-time bidi: handler reads request envelopes lazily via the
+    // request channel and writes response envelopes through an outbound
+    // queue that the response writer drains. Same first-send-or-finish
+    // gate as server-stream so response headers commit at the right time.
+    val requestChannel = call.receiveChannel()
+    val msgRequestCodec = codec.codec(handler.methodSpec.requestClass)
+    val msgResponseCodec = codec.codec(handler.methodSpec.responseClass)
 
-    val outbound = mutableListOf<ByteArray>()
-    val bidi = BufferedBidiStream<Any, Any>(messages, ctx.requestHeaders) { message ->
-        outbound += codec.codec(handler.methodSpec.responseClass)
-            .serialize(message)
-            .readByteArray()
-    }
+    val outboundQueue = Channel<ByteArray>(Channel.UNLIMITED)
+    val readyToCommit = CompletableDeferred<Unit>()
+    val handlerErrorRef = java.util.concurrent.atomic.AtomicReference<ConnectException?>(null)
 
-    val handlerError = try {
-        invokeWithTimeout(ctx.timeoutMs) { handler.handle(bidi, ctx) }
-        null
-    } catch (ex: TimeoutCancellationException) {
-        ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
-    } catch (ex: ConnectException) {
-        ex
-    }
-
-    writeStreamResponseHeaders(call, ctx)
-    respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
-        for (payload in outbound) {
-            writeFully(encodeEnvelope(0, payload))
+    coroutineScope {
+        val handlerJob = async {
+            val bidi = StreamingBidiStream<Any, Any>(
+                headers = ctx.requestHeaders,
+                requestChannel = requestChannel,
+                onSend = { message ->
+                    readyToCommit.complete(Unit)
+                    outboundQueue.send(msgResponseCodec.serialize(message).readByteArray())
+                },
+                requestCodec = msgRequestCodec,
+                pool = pool,
+                maxReceiveMessageSize = opts.maxReceiveMessageSize,
+            )
+            try {
+                invokeWithTimeout(ctx.timeoutMs) { handler.handle(bidi, ctx) }
+            } catch (ex: TimeoutCancellationException) {
+                handlerErrorRef.set(ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
+            } catch (ex: ConnectException) {
+                handlerErrorRef.set(ex)
+            } finally {
+                readyToCommit.complete(Unit)
+                outboundQueue.close()
+            }
         }
+
+        readyToCommit.await()
+        writeStreamResponseHeaders(call, ctx)
+
+        val ct = ContentType.parse(requestContentType)
+        val trailerHeadersRef = java.util.concurrent.atomic.AtomicReference<Headers>(Headers.Empty)
+        call.respond(
+            FramedStreamingContent(
+                ct = ct,
+                getTrailers = { trailerHeadersRef.get() },
+                writeBody = { responseChannel ->
+                    for (payload in outboundQueue) {
+                        responseChannel.writeFully(encodeEnvelope(0, payload))
+                        responseChannel.flush()
+                    }
+                    handlerJob.await()
+                    val userTrailers = ctx.responseTrailers.mapValues { it.value.toList() }
+                    val err = handlerErrorRef.get()
+                    if (protocol.usesHttpTrailers) {
+                        trailerHeadersRef.set(headersFromPairs(protocol.buildHttpTrailers(err, userTrailers)))
+                    } else {
+                        responseChannel.writeFully(
+                            encodeEnvelope(
+                                protocol.trailerEnvelopeFlag,
+                                protocol.buildTrailerPayload(err, userTrailers),
+                            ),
+                        )
+                    }
+                },
+            ),
+        )
     }
 }
+
+private class StreamingBidiStream<Req : Any, Res : Any>(
+    override val headers: ConnectHeaders,
+    private val requestChannel: ByteReadChannel,
+    private val onSend: suspend (Res) -> Unit,
+    private val requestCodec: com.connectrpc.Codec<Req>,
+    private val pool: CompressionPool?,
+    private val maxReceiveMessageSize: Int,
+) : BidiStream<Req, Res> {
+    override suspend fun receive(): Req? {
+        val env = readEnvelopeFromChannel(requestChannel) ?: return null
+        val decoded = decompressEnvelopeIfNeeded(env, pool)
+            ?: throw ConnectException(
+                Code.INTERNAL_ERROR,
+                "request envelope marked compressed but no compression negotiated",
+            )
+        if (maxReceiveMessageSize > 0 && decoded.payload.size > maxReceiveMessageSize) {
+            throw ConnectException(
+                Code.RESOURCE_EXHAUSTED,
+                "message size ${decoded.payload.size} exceeds limit of $maxReceiveMessageSize",
+            )
+        }
+        return requestCodec.deserialize(Buffer().write(decoded.payload))
+    }
+
+    override suspend fun send(message: Res) = onSend(message)
+}
+
+private suspend fun readEnvelopeFromChannel(
+    channel: ByteReadChannel,
+): com.connectrpc.server.protocol.ConnectEnvelope? =
+    com.connectrpc.server.protocol.readEnvelopeFromBytes(
+        readByte = {
+            try {
+                channel.readByte().toInt() and 0xff
+            } catch (_: Exception) {
+                -1
+            }
+        },
+        readBytes = { n -> channel.readByteArray(n) },
+    )
 
 
 /**
