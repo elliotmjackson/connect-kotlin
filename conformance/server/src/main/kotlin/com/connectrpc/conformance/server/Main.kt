@@ -68,9 +68,13 @@ internal fun runBlockingMain(
     output: OutputStream,
 ) {
     val request = readServerCompatRequest(input)
-    if (request.httpVersion != HTTPVersion.HTTP_VERSION_1) {
-        System.err.println("server currently only supports HTTP_VERSION_1, got ${request.httpVersion}")
-        exitProcess(1)
+    val wantHttp2 = when (request.httpVersion) {
+        HTTPVersion.HTTP_VERSION_1 -> false
+        HTTPVersion.HTTP_VERSION_2 -> true
+        else -> {
+            System.err.println("server only supports HTTP/1.1 and HTTP/2, got ${request.httpVersion}")
+            exitProcess(1)
+        }
     }
 
     val tlsCertPem: ByteArray? = if (request.useTls) {
@@ -104,9 +108,7 @@ internal fun runBlockingMain(
                     host = "127.0.0.1"
                     port = 0
                 }
-                // Stage 1: HTTP/1 + TLS only. ALPN should advertise http/1.1
-                // by default with enableHttp2 false.
-                enableHttp2 = false
+                enableHttp2 = wantHttp2
                 enableH2c = false
             },
             module = {

@@ -4,6 +4,7 @@
 features:
   versions:
     - HTTP_VERSION_1
+    - HTTP_VERSION_2
   protocols:
     - PROTOCOL_CONNECT
     - PROTOCOL_GRPC_WEB
@@ -20,5 +21,6 @@ features:
   supportsHalfDuplexBidiOverHttp1: true
   supportsTls: true
   supportsTlsClientCerts: false
+  supportsH2c: false
   supportsMessageReceiveLimit: false
   supportsConnectGet: false
