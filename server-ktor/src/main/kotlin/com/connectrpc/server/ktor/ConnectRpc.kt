@@ -78,6 +78,8 @@ private const val GRPC_TIMEOUT_HEADER = "Grpc-Timeout"
 private const val CONNECT_CONTENT_ENCODING_HEADER = "Connect-Content-Encoding"
 private const val GRPC_ENCODING_HEADER = "Grpc-Encoding"
 private const val IDENTITY_ENCODING = "identity"
+private const val CONNECT_PROTOCOL_VERSION_HEADER = "Connect-Protocol-Version"
+private const val CONNECT_PROTOCOL_VERSION_VALUE = "1"
 
 /** Compression algorithms recognized server-side. Always includes identity. */
 private val COMPRESSION_POOLS: Map<String, CompressionPool> = mapOf(
@@ -96,11 +98,18 @@ fun Application.connectRpc(
      * from the conformance suite.
      */
     maxReceiveMessageSize: Int = 0,
+    /**
+     * If true, Connect protocol POSTs missing `Connect-Protocol-Version: 1`
+     * are rejected with INVALID_ARGUMENT. Off by default per the Connect spec
+     * (header is recommended but not required for backwards compatibility).
+     * Mirrors connect-go's `RequireConnectProtocolHeader` handler option.
+     */
+    requireConnectProtocolHeader: Boolean = false,
 ) {
     routing {
         for (procedure in registry.procedures) {
             post("/$procedure") {
-                dispatch(call, registry, procedure, maxReceiveMessageSize)
+                dispatch(call, registry, procedure, maxReceiveMessageSize, requireConnectProtocolHeader)
             }
             val handler = registry.find(procedure)
             if (handler != null && handler.methodSpec.idempotency == Idempotency.NO_SIDE_EFFECTS) {
@@ -162,6 +171,7 @@ private suspend fun dispatch(
     registry: HandlerRegistry,
     procedure: String,
     maxReceiveMessageSize: Int,
+    requireConnectProtocolHeader: Boolean,
 ) {
     val contentType = call.request.contentType().withoutParameters().toString()
     val (codecName, protocol) = when (contentType) {
@@ -187,6 +197,48 @@ private suspend fun dispatch(
         )
         return
     }
+
+    val isConnectProtocol = protocol == null || protocol === CONNECT_STREAMING
+    val isGrpcProtocol = protocol === GRPC_STREAMING
+
+    if (isConnectProtocol && requireConnectProtocolHeader) {
+        // Connect spec: Connect-Protocol-Version is recommended but not
+        // required. Servers may opt in to enforcement via the
+        // requireConnectProtocolHeader flag — useful when the server only
+        // talks to known-recent clients. (GET requests use ?connect=v1 and
+        // are routed through dispatchConnectGet.)
+        val version = call.request.headers[CONNECT_PROTOCOL_VERSION_HEADER]
+        if (version != CONNECT_PROTOCOL_VERSION_VALUE) {
+            val msg = if (version == null) {
+                "missing required header: $CONNECT_PROTOCOL_VERSION_HEADER"
+            } else {
+                "unsupported $CONNECT_PROTOCOL_VERSION_HEADER: $version"
+            }
+            if (protocol == null) {
+                respondConnectUnaryError(call, ctx = null, ConnectException(Code.INVALID_ARGUMENT, msg))
+            } else {
+                respondStreamError(call, contentType, ctx = null, protocol, ConnectException(Code.INVALID_ARGUMENT, msg))
+            }
+            return
+        }
+    }
+    if (isGrpcProtocol) {
+        // gRPC requires TE: trailers per the spec — reject otherwise so
+        // misconfigured clients fail fast.
+        val teValues = call.request.headers.getAll("TE").orEmpty()
+        val hasTrailers = teValues.any { it.split(',').any { v -> v.trim().equals("trailers", ignoreCase = true) } }
+        if (!hasTrailers) {
+            respondStreamError(
+                call,
+                contentType,
+                ctx = null,
+                protocol!!,
+                ConnectException(Code.INTERNAL_ERROR, "missing required header: TE: trailers"),
+            )
+            return
+        }
+    }
+
     if (protocol == null) {
         handleConnectUnary(call, registry, procedure, codec, contentType, maxReceiveMessageSize)
     } else {
@@ -965,24 +1017,32 @@ private suspend fun respondStreamError(
 ) {
     if (ctx != null) writeStreamResponseHeaders(call, ctx)
     val userTrailers = ctx?.responseTrailers?.mapValues { it.value.toList() } ?: emptyMap()
-    val trailers: Headers = if (protocol.usesHttpTrailers) {
-        headersFromPairs(protocol.buildHttpTrailers(exception, userTrailers))
-    } else {
-        Headers.Empty
+    if (protocol.usesHttpTrailers) {
+        // gRPC trailers-only response: there's no body to write, so HTTP/1.1
+        // chunked-trailer framing won't fire reliably. Mirror connect-go's
+        // approach by promoting the grpc-* trailer pairs to regular response
+        // headers — they reach the client either way.
+        for ((name, value) in protocol.buildHttpTrailers(exception, userTrailers)) {
+            call.response.headers.append(name, value, safeOnly = false)
+        }
+        call.respondBytes(
+            bytes = ByteArray(0),
+            contentType = ContentType.parse(requestContentType),
+            status = HttpStatusCode.OK,
+        )
+        return
     }
     call.respond(
         FramedStreamingContent(
             ct = ContentType.parse(requestContentType),
-            getTrailers = { trailers },
+            getTrailers = { Headers.Empty },
             writeBody = { channel ->
-                if (!protocol.usesHttpTrailers) {
-                    channel.writeFully(
-                        encodeEnvelope(
-                            protocol.trailerEnvelopeFlag,
-                            protocol.buildTrailerPayload(exception, userTrailers),
-                        ),
-                    )
-                }
+                channel.writeFully(
+                    encodeEnvelope(
+                        protocol.trailerEnvelopeFlag,
+                        protocol.buildTrailerPayload(exception, userTrailers),
+                    ),
+                )
             },
         ),
     )

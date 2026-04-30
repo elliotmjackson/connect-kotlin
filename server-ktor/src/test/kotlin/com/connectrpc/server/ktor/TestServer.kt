@@ -18,6 +18,7 @@ import com.connectrpc.server.HandlerRegistry
 import io.ktor.server.application.Application
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.applicationEnvironment
+import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.netty.Netty
 import io.ktor.server.netty.NettyApplicationEngine
@@ -45,16 +46,25 @@ internal class TestServer private constructor(
             registry: HandlerRegistry,
             withH2c: Boolean = false,
             maxReceiveMessageSize: Int = 0,
+            requireConnectProtocolHeader: Boolean = false,
         ): TestServer {
             val server = embeddedServer(
                 factory = Netty,
                 environment = applicationEnvironment { },
                 configure = {
+                    connector {
+                        host = "127.0.0.1"
+                        port = 0
+                    }
                     enableH2c = withH2c
                     enableHttp2 = false
                 },
                 module = {
-                    connectRpc(registry, maxReceiveMessageSize = maxReceiveMessageSize)
+                    connectRpc(
+                        registry,
+                        maxReceiveMessageSize = maxReceiveMessageSize,
+                        requireConnectProtocolHeader = requireConnectProtocolHeader,
+                    )
                 },
             )
             server.start(wait = false)

@@ -35,14 +35,13 @@ import org.junit.Test
 class ProtocolValidationTest {
 
     /**
-     * Connect spec requires `Connect-Protocol-Version: 1` on POST requests.
-     * Servers should reject requests missing this header (or with a different
-     * version) with a Connect error.
-     *
-     * Currently fails: we accept requests regardless of the version header.
+     * Connect spec: `Connect-Protocol-Version: 1` is recommended on POST
+     * requests but not required for backwards compatibility. Servers can opt
+     * in to enforcement via [connectRpc]'s `requireConnectProtocolHeader`
+     * flag. With it enabled, a request missing the header is rejected with
+     * INVALID_ARGUMENT.
      */
     @Test
-    @Ignore("TDD target: Connect-Protocol-Version header is not validated")
     fun connectRejectsMissingProtocolVersion() {
         val handler = unaryHandler { _, _ -> TestMessage("ok") }
         val registry = HandlerRegistry.builder()
@@ -50,7 +49,7 @@ class ProtocolValidationTest {
             .register(handler)
             .build()
 
-        TestServer.start(registry).use { server ->
+        TestServer.start(registry, requireConnectProtocolHeader = true).use { server ->
             val req = Request.Builder()
                 .url("${server.baseUrl}/test.v1.TestService/Unary")
                 .header("Content-Type", "application/proto")
@@ -76,7 +75,6 @@ class ProtocolValidationTest {
      * Currently fails: we accept gRPC requests regardless of the TE header.
      */
     @Test
-    @Ignore("TDD target: gRPC TE: trailers requirement is not validated")
     fun grpcRejectsMissingTeTrailers() {
         val handler = unaryHandler { _, _ -> TestMessage("ok") }
         val registry = HandlerRegistry.builder()
@@ -93,18 +91,13 @@ class ProtocolValidationTest {
                 .build()
 
             newTestClient().newCall(req).execute().use { response ->
-                // Should produce an envelope-encoded error or a refusal.
-                // Per connect-go behavior, this is an INTERNAL or UNKNOWN
-                // error reported via the trailer.
-                val body = response.body!!.string()
-                assertThat(body)
-                    .describedAs("server should signal an error for missing TE: trailers")
-                    .satisfiesAnyOf(
-                        { assertThat(it).contains("\"code\"") },
-                        { assertThat(it).contains("grpc-status") },
-                    )
-                // grpc-status MUST not be 0 (success) when no TE header was sent.
-                assertThat(body).doesNotContain("grpc-status: 0")
+                val trailerStatus = response.trailers()["grpc-status"]
+                val combinedHeaderStatus = response.header("grpc-status")
+                val status = trailerStatus ?: combinedHeaderStatus
+                assertThat(status)
+                    .describedAs("server must surface a non-zero grpc-status when TE: trailers is missing")
+                    .isNotNull()
+                    .isNotEqualTo("0")
             }
         }
     }
