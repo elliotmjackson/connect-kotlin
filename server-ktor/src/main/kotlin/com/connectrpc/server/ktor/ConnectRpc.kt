@@ -30,6 +30,7 @@ import com.connectrpc.server.ClientMessageStream
 import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
+import com.connectrpc.server.ServerInterceptor
 import com.connectrpc.server.ServerMessageStream
 import com.connectrpc.server.ServerStreamHandler
 import com.connectrpc.server.UnaryHandler
@@ -293,7 +294,7 @@ private suspend fun handleConnectUnary(
         return
     }
     @Suppress("UNCHECKED_CAST")
-    val unary = handler as UnaryHandler<Any, Any>
+    val unary = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors)
 
     val ctx = newHandlerContext(call, procedure)
 
@@ -447,22 +448,22 @@ private suspend fun handleStreaming(
                 return
             }
             @Suppress("UNCHECKED_CAST")
-            val uh = handler as UnaryHandler<Any, Any>
+            val uh = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors)
             handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.SERVER -> {
             @Suppress("UNCHECKED_CAST")
-            val sh = handler as ServerStreamHandler<Any, Any>
+            val sh = (handler as ServerStreamHandler<Any, Any>).wrapServerStream(registry.interceptors)
             handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.CLIENT -> {
             @Suppress("UNCHECKED_CAST")
-            val ch = handler as ClientStreamHandler<Any, Any>
+            val ch = (handler as ClientStreamHandler<Any, Any>).wrapClientStream(registry.interceptors)
             handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.BIDI -> {
             @Suppress("UNCHECKED_CAST")
-            val bh = handler as BidiStreamHandler<Any, Any>
+            val bh = (handler as BidiStreamHandler<Any, Any>).wrapBidi(registry.interceptors)
             handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
     }
@@ -1131,7 +1132,7 @@ private suspend fun dispatchConnectGet(
         return
     }
     @Suppress("UNCHECKED_CAST")
-    val unary = handler as UnaryHandler<Any, Any>
+    val unary = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors)
     val request = try {
         codec.codec(unary.methodSpec.requestClass).deserialize(Buffer().write(decompressed))
     } catch (ex: Exception) {
@@ -1278,3 +1279,47 @@ private fun writeStreamResponseHeaders(call: ApplicationCall, ctx: HandlerContex
 
 private fun io.ktor.http.Headers.toMap(): Map<String, List<String>> =
     entries().associate { it.key to it.value }
+
+/**
+ * Composes the interceptor chain around a handler. The first interceptor in
+ * the list runs outermost (sees the request first, response last).
+ */
+private fun <Req : Any, Res : Any> UnaryHandler<Req, Res>.wrapUnary(
+    interceptors: List<ServerInterceptor>,
+): UnaryHandler<Req, Res> {
+    var current: UnaryHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapUnary(current)
+    }
+    return current
+}
+
+private fun <Req : Any, Res : Any> ServerStreamHandler<Req, Res>.wrapServerStream(
+    interceptors: List<ServerInterceptor>,
+): ServerStreamHandler<Req, Res> {
+    var current: ServerStreamHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapServerStream(current)
+    }
+    return current
+}
+
+private fun <Req : Any, Res : Any> ClientStreamHandler<Req, Res>.wrapClientStream(
+    interceptors: List<ServerInterceptor>,
+): ClientStreamHandler<Req, Res> {
+    var current: ClientStreamHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapClientStream(current)
+    }
+    return current
+}
+
+private fun <Req : Any, Res : Any> BidiStreamHandler<Req, Res>.wrapBidi(
+    interceptors: List<ServerInterceptor>,
+): BidiStreamHandler<Req, Res> {
+    var current: BidiStreamHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapBidi(current)
+    }
+    return current
+}

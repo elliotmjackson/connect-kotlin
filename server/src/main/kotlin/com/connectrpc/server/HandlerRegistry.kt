@@ -26,6 +26,11 @@ import com.connectrpc.SerializationStrategy
 class HandlerRegistry private constructor(
     private val handlers: Map<String, Handler<*, *>>,
     private val codecs: Map<String, SerializationStrategy>,
+    /**
+     * Interceptors in registration order — the first registered is outermost
+     * (sees the request first, response last).
+     */
+    val interceptors: List<ServerInterceptor>,
 ) {
     /** All registered procedure paths. */
     val procedures: Set<String> get() = handlers.keys
@@ -42,6 +47,7 @@ class HandlerRegistry private constructor(
     class Builder {
         private val handlers = mutableMapOf<String, Handler<*, *>>()
         private val codecs = mutableMapOf<String, SerializationStrategy>()
+        private val interceptors = mutableListOf<ServerInterceptor>()
 
         fun register(handler: Handler<*, *>): Builder = apply {
             val path = handler.methodSpec.path
@@ -61,9 +67,14 @@ class HandlerRegistry private constructor(
             }
         }
 
+        /** Registers an interceptor. Interceptors run in the order they were added. */
+        fun interceptor(interceptor: ServerInterceptor): Builder = apply {
+            interceptors += interceptor
+        }
+
         fun build(): HandlerRegistry {
             require(codecs.isNotEmpty()) { "at least one codec must be registered" }
-            return HandlerRegistry(handlers.toMap(), codecs.toMap())
+            return HandlerRegistry(handlers.toMap(), codecs.toMap(), interceptors.toList())
         }
     }
 
