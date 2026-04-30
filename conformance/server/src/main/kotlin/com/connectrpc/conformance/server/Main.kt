@@ -107,13 +107,7 @@ private fun buildConformanceRegistry(): HandlerRegistry =
         .codec(GoogleJavaProtobufStrategy())
         .codec(GoogleJavaJSONStrategy())
         .register(ConformanceUnaryHandler())
-        .register(
-            unimplementedServerStream(
-                "$SERVICE_PATH/ServerStream",
-                ServerStreamRequest::class,
-                ServerStreamResponse::class,
-            ),
-        )
+        .register(ConformanceServerStreamHandler())
         .register(
             unimplementedClientStream(
                 "$SERVICE_PATH/ClientStream",

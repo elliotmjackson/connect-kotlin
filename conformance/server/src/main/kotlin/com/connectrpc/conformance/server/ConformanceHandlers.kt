@@ -26,10 +26,15 @@ import com.connectrpc.conformance.v1.ConformancePayload
 import com.connectrpc.conformance.v1.Header
 import com.connectrpc.conformance.v1.IdempotentUnaryRequest
 import com.connectrpc.conformance.v1.IdempotentUnaryResponse
+import com.connectrpc.conformance.v1.ServerStreamRequest
+import com.connectrpc.conformance.v1.ServerStreamResponse
+import com.connectrpc.conformance.v1.StreamResponseDefinition
 import com.connectrpc.conformance.v1.UnaryRequest
 import com.connectrpc.conformance.v1.UnaryResponse
 import com.connectrpc.conformance.v1.UnaryResponseDefinition
 import com.connectrpc.server.HandlerContext
+import com.connectrpc.server.ServerMessageStream
+import com.connectrpc.server.ServerStreamHandler
 import com.connectrpc.server.UnaryHandler
 import com.google.protobuf.Any
 import com.google.protobuf.Message
@@ -127,6 +132,64 @@ private fun buildRequestInfo(
         builder.timeoutMs = t
     }
     return builder.build()
+}
+
+internal class ConformanceServerStreamHandler :
+    ServerStreamHandler<ServerStreamRequest, ServerStreamResponse> {
+    override val methodSpec = MethodSpec(
+        "$SERVICE_PATH/ServerStream",
+        ServerStreamRequest::class,
+        ServerStreamResponse::class,
+        StreamType.SERVER,
+    )
+
+    override suspend fun handle(
+        request: ServerStreamRequest,
+        ctx: HandlerContext,
+        stream: ServerMessageStream<ServerStreamResponse>,
+    ) {
+        val def = if (request.hasResponseDefinition()) request.responseDefinition else null
+        val requestInfo = buildRequestInfo(ctx, listOf(packAny(request)))
+
+        if (def == null) return
+
+        for (h in def.responseHeadersList) {
+            ctx.responseHeaders.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+        }
+        for (h in def.responseTrailersList) {
+            ctx.responseTrailers.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+        }
+
+        for ((index, data) in def.responseDataList.withIndex()) {
+            if (def.responseDelayMs > 0) {
+                delay(def.responseDelayMs.toLong())
+            }
+            val payloadBuilder = ConformancePayload.newBuilder().setData(data)
+            // Only the first response carries the request info per the spec.
+            if (index == 0) {
+                payloadBuilder.setRequestInfo(requestInfo)
+            }
+            stream.send(
+                ServerStreamResponse.newBuilder().setPayload(payloadBuilder.build()).build(),
+            )
+        }
+
+        if (def.hasError()) {
+            val err = def.error
+            val code = Code.fromValue(err.code.number) ?: Code.UNKNOWN
+            val message = if (err.hasMessage()) err.message else null
+            // Per spec: when no responses were sent, build a RequestInfo and add to details.
+            val details = mutableListOf<ConnectErrorDetail>()
+            if (def.responseDataList.isEmpty()) {
+                details += packAny(requestInfo).toConnectErrorDetail()
+            }
+            for (d in err.detailsList) {
+                details += d.toConnectErrorDetail()
+            }
+            throw ConnectException(code = code, message = message)
+                .withErrorDetails(NoopErrorDetailParser, details)
+        }
+    }
 }
 
 private fun packAny(message: Message): Any = Any.pack(message)
