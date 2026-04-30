@@ -19,7 +19,9 @@ features:
     - STREAM_TYPE_SERVER_STREAM
     - STREAM_TYPE_CLIENT_STREAM
     - STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM
-    # full-duplex bidi requires HTTP/2; not supported yet
+    # full-duplex bidi requires real-time streaming response headers, which
+    # Ktor commits eagerly on call.respond(); buffered responses deadlock the
+    # harness's interleaving client. Tracked as future work.
   supportsHalfDuplexBidiOverHttp1: true
   supportsTls: true
   supportsTlsClientCerts: true

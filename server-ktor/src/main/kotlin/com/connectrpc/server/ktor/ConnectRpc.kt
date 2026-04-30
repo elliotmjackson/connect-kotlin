@@ -546,6 +546,7 @@ private suspend fun handleBidiStream(
     }
 }
 
+
 /**
  * Writes the streaming response: caller-supplied body messages first, then —
  * for envelope-trailer protocols — a trailer envelope, followed (if the

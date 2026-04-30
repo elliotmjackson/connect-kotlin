@@ -281,65 +281,135 @@ internal class ConformanceBidiStreamHandler :
         stream: BidiStream<BidiStreamRequest, BidiStreamResponse>,
         ctx: HandlerContext,
     ) {
-        val received = mutableListOf<BidiStreamRequest>()
-        var def: StreamResponseDefinition? = null
-        var fullDuplex = false
+        // Read the first message to discover full_duplex flag and definition.
+        val first = stream.receive() ?: return
+        val def: StreamResponseDefinition? =
+            if (first.hasResponseDefinition()) first.responseDefinition else null
+        val fullDuplex = first.fullDuplex
+
+        if (def != null) {
+            for (h in def.responseHeadersList) {
+                ctx.responseHeaders.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+            }
+            for (h in def.responseTrailersList) {
+                ctx.responseTrailers.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+            }
+        }
+
+        if (fullDuplex) {
+            handleFullDuplex(stream, ctx, def, first)
+        } else {
+            handleHalfDuplex(stream, ctx, def, first)
+        }
+    }
+
+    private suspend fun handleHalfDuplex(
+        stream: BidiStream<BidiStreamRequest, BidiStreamResponse>,
+        ctx: HandlerContext,
+        def: StreamResponseDefinition?,
+        first: BidiStreamRequest,
+    ) {
+        val received = mutableListOf(first)
         while (true) {
             val msg = stream.receive() ?: break
-            if (received.isEmpty()) {
-                if (msg.hasResponseDefinition()) def = msg.responseDefinition
-                fullDuplex = msg.fullDuplex
-            }
             received += msg
         }
-
-        // Half-duplex only over HTTP/1; full-duplex would require true streaming
-        // and is filtered out by server-config.yaml.
-        if (fullDuplex) {
-            throw ConnectException(
-                Code.UNIMPLEMENTED,
-                "full-duplex bidi streams require HTTP/2 (not supported)",
-            )
-        }
-
         val requestInfo = buildRequestInfo(ctx, received.map { packAny(it) })
 
         if (def == null) return
-
-        for (h in def.responseHeadersList) {
-            ctx.responseHeaders.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
-        }
-        for (h in def.responseTrailersList) {
-            ctx.responseTrailers.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
-        }
 
         for ((index, data) in def.responseDataList.withIndex()) {
             if (def.responseDelayMs > 0) {
                 delay(def.responseDelayMs.toLong())
             }
             val payloadBuilder = ConformancePayload.newBuilder().setData(data)
-            if (index == 0) {
-                payloadBuilder.setRequestInfo(requestInfo)
-            }
+            if (index == 0) payloadBuilder.setRequestInfo(requestInfo)
             stream.send(
                 BidiStreamResponse.newBuilder().setPayload(payloadBuilder.build()).build(),
             )
         }
 
         if (def.hasError()) {
-            val err = def.error
-            val code = Code.fromValue(err.code.number) ?: Code.UNKNOWN
-            val message = if (err.hasMessage()) err.message else null
-            val details = mutableListOf<ConnectErrorDetail>()
-            if (def.responseDataList.isEmpty()) {
-                details += packAny(requestInfo).toConnectErrorDetail()
-            }
-            for (d in err.detailsList) {
-                details += d.toConnectErrorDetail()
-            }
-            throw ConnectException(code = code, message = message)
-                .withErrorDetails(NoopErrorDetailParser, details)
+            throwResponseDefError(def, requestInfo, hadResponses = def.responseDataList.isNotEmpty())
         }
+    }
+
+    private suspend fun handleFullDuplex(
+        stream: BidiStream<BidiStreamRequest, BidiStreamResponse>,
+        ctx: HandlerContext,
+        def: StreamResponseDefinition?,
+        first: BidiStreamRequest,
+    ) {
+        // Per the spec: read one request, send one response, alternate. The
+        // first response carries the full request_info; later responses carry
+        // only the most recently received request.
+        val pending = mutableListOf<BidiStreamRequest>(first)
+        var respIdx = 0
+        var firstResponse = true
+        var lastRequestInfo: ConformancePayload.RequestInfo? = null
+        while (true) {
+            if (def == null || respIdx >= def.responseDataList.size) {
+                // Drain any remaining requests but cannot send more.
+                if (def?.hasError() == true) {
+                    val info = lastRequestInfo
+                        ?: buildRequestInfo(ctx, pending.map { packAny(it) })
+                    throwResponseDefError(def, info, hadResponses = respIdx > 0)
+                }
+                while (stream.receive() != null) {
+                    // discard
+                }
+                break
+            }
+            if (def.responseDelayMs > 0) {
+                delay(def.responseDelayMs.toLong())
+            }
+            val info = buildRequestInfo(ctx, pending.map { packAny(it) })
+            lastRequestInfo = info
+            val payloadBuilder = ConformancePayload.newBuilder()
+                .setData(def.responseDataList[respIdx])
+            if (firstResponse) {
+                payloadBuilder.setRequestInfo(info)
+                firstResponse = false
+            } else {
+                payloadBuilder.setRequestInfo(
+                    ConformancePayload.RequestInfo.newBuilder()
+                        .addAllRequests(pending.map { packAny(it) })
+                        .build(),
+                )
+            }
+            stream.send(
+                BidiStreamResponse.newBuilder().setPayload(payloadBuilder.build()).build(),
+            )
+            respIdx++
+            pending.clear()
+            val next = stream.receive() ?: break
+            pending += next
+        }
+
+        if (def?.hasError() == true) {
+            val info = lastRequestInfo
+                ?: buildRequestInfo(ctx, pending.map { packAny(it) })
+            throwResponseDefError(def, info, hadResponses = respIdx > 0)
+        }
+    }
+
+    private fun throwResponseDefError(
+        def: StreamResponseDefinition,
+        requestInfo: ConformancePayload.RequestInfo,
+        hadResponses: Boolean,
+    ) {
+        val err = def.error
+        val code = Code.fromValue(err.code.number) ?: Code.UNKNOWN
+        val message = if (err.hasMessage()) err.message else null
+        val details = mutableListOf<ConnectErrorDetail>()
+        if (!hadResponses) {
+            details += packAny(requestInfo).toConnectErrorDetail()
+        }
+        for (d in err.detailsList) {
+            details += d.toConnectErrorDetail()
+        }
+        throw ConnectException(code = code, message = message)
+            .withErrorDetails(NoopErrorDetailParser, details)
     }
 }
 

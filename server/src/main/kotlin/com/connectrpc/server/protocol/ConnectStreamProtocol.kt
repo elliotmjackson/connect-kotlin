@@ -56,6 +56,45 @@ fun encodeEnvelope(flags: Int, payload: ByteArray): ByteArray {
 }
 
 /**
+ * Reads exactly [n] bytes from [readByte], returning null if EOF is hit
+ * before any byte is read. Throws [ConnectException] on partial reads.
+ */
+suspend fun readEnvelopeFromBytes(
+    readByte: suspend () -> Int,
+    readBytes: suspend (Int) -> ByteArray,
+): ConnectEnvelope? {
+    val first = try {
+        readByte()
+    } catch (_: Exception) {
+        return null
+    }
+    if (first < 0) return null
+    val flagsByte = first
+    val lenBytes = ByteArray(4)
+    for (i in 0 until 4) {
+        val b = try {
+            readByte()
+        } catch (_: Exception) {
+            throw ConnectException(Code.INVALID_ARGUMENT, "envelope header truncated")
+        }
+        if (b < 0) throw ConnectException(Code.INVALID_ARGUMENT, "envelope header truncated")
+        lenBytes[i] = b.toByte()
+    }
+    val len = (lenBytes[0].toInt() and 0xff shl 24) or
+        (lenBytes[1].toInt() and 0xff shl 16) or
+        (lenBytes[2].toInt() and 0xff shl 8) or
+        (lenBytes[3].toInt() and 0xff)
+    val payload = readBytes(len)
+    if (payload.size != len) {
+        throw ConnectException(
+            Code.INVALID_ARGUMENT,
+            "envelope payload truncated: expected $len bytes, got ${payload.size}",
+        )
+    }
+    return ConnectEnvelope(flagsByte, payload)
+}
+
+/**
  * Reads one envelope from [buffer], advancing it. Returns null if the buffer
  * is exhausted before any header byte. Throws [ConnectException] if a partial
  * envelope is found (header read but payload truncated).
