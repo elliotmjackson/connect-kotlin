@@ -161,7 +161,10 @@ private data class StreamingProtocol(
     val trailerEnvelopeFlag: Int,
     val buildTrailerPayload: (ConnectException?, Map<String, List<String>>) -> ByteArray,
     val buildHttpTrailers: (ConnectException?, Map<String, List<String>>) -> List<Pair<String, String>>,
+    /** Request-side compression header — also names the response-side header by convention. */
     val compressionHeader: String,
+    /** Header the client uses to advertise outbound encodings it can decompress. */
+    val acceptEncodingHeader: String,
     /** gRPC and gRPC-Web frame unary too; Connect doesn't (unary uses application/proto). */
     val framesUnary: Boolean,
     val usesHttpTrailers: Boolean,
@@ -172,6 +175,7 @@ private val CONNECT_STREAMING = StreamingProtocol(
     buildTrailerPayload = ::endStreamJsonPayload,
     buildHttpTrailers = { _, _ -> emptyList() },
     compressionHeader = CONNECT_CONTENT_ENCODING_HEADER,
+    acceptEncodingHeader = "Connect-Accept-Encoding",
     framesUnary = false,
     usesHttpTrailers = false,
 )
@@ -181,6 +185,7 @@ private val GRPC_WEB_STREAMING = StreamingProtocol(
     buildTrailerPayload = ::grpcWebTrailerPayload,
     buildHttpTrailers = { _, _ -> emptyList() },
     compressionHeader = GRPC_ENCODING_HEADER,
+    acceptEncodingHeader = "Grpc-Accept-Encoding",
     framesUnary = true,
     usesHttpTrailers = false,
 )
@@ -190,6 +195,7 @@ private val GRPC_STREAMING = StreamingProtocol(
     buildTrailerPayload = { _, _ -> ByteArray(0) },
     buildHttpTrailers = ::grpcTrailerPairs,
     compressionHeader = GRPC_ENCODING_HEADER,
+    acceptEncodingHeader = "Grpc-Accept-Encoding",
     framesUnary = true,
     usesHttpTrailers = true,
 )
@@ -387,12 +393,35 @@ private fun maybeCompressOutbound(
     compressMinBytes: Int,
 ): Pair<ByteArray, String?> {
     if (acceptEncoding == null || bytes.size < compressMinBytes) return bytes to null
+    val pool = pickPool(acceptEncoding) ?: return bytes to null
+    val compressed = pool.compress(Buffer().write(bytes)).readByteArray()
+    return compressed to pool.name()
+}
+
+private fun pickPool(acceptEncoding: String?): CompressionPool? {
+    if (acceptEncoding == null) return null
     val accepted = acceptEncoding.split(',')
         .map { it.substringBefore(';').trim().lowercase() }
         .filter { it.isNotEmpty() }
-    val pool = accepted.firstNotNullOfOrNull { COMPRESSION_POOLS[it] } ?: return bytes to null
-    val compressed = pool.compress(Buffer().write(bytes)).readByteArray()
-    return compressed to pool.name()
+    return accepted.firstNotNullOfOrNull { COMPRESSION_POOLS[it] }
+}
+
+/**
+ * Encodes a streaming envelope, optionally gzipping the payload when [pool]
+ * is non-null and the payload meets the [compressMinBytes] threshold. The
+ * compressed flag (0x01) is OR'd into the envelope flags when applicable.
+ */
+private fun encodeOutboundEnvelope(
+    flags: Int,
+    payload: ByteArray,
+    pool: CompressionPool?,
+    compressMinBytes: Int,
+): ByteArray {
+    if (pool == null || payload.size < compressMinBytes) {
+        return encodeEnvelope(flags, payload)
+    }
+    val compressed = pool.compress(Buffer().write(payload)).readByteArray()
+    return encodeEnvelope(flags or ENVELOPE_FLAG_COMPRESSED, compressed)
 }
 
 private suspend fun handleStreaming(
@@ -584,6 +613,7 @@ private suspend fun handleServerStream(
     val outboundQueue = Channel<ByteArray>(Channel.UNLIMITED)
     val readyToCommit = CompletableDeferred<Unit>()
     val handlerErrorRef = java.util.concurrent.atomic.AtomicReference<ConnectException?>(null)
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
 
     coroutineScope {
         val handlerJob = async {
@@ -607,6 +637,9 @@ private suspend fun handleServerStream(
 
         readyToCommit.await()
         writeStreamResponseHeaders(call, ctx)
+        if (outPool != null) {
+            call.response.headers.append(protocol.compressionHeader, outPool.name(), safeOnly = false)
+        }
 
         val ct = ContentType.parse(requestContentType)
         val trailerHeadersRef = java.util.concurrent.atomic.AtomicReference<Headers>(Headers.Empty)
@@ -616,7 +649,9 @@ private suspend fun handleServerStream(
                 getTrailers = { trailerHeadersRef.get() },
                 writeBody = { responseChannel ->
                     for (payload in outboundQueue) {
-                        responseChannel.writeFully(encodeEnvelope(0, payload))
+                        responseChannel.writeFully(
+                            encodeOutboundEnvelope(0, payload, outPool, opts.compressMinBytes),
+                        )
                         responseChannel.flush()
                     }
                     handlerJob.await()
@@ -687,6 +722,7 @@ private suspend fun handleBidiStream(
     val requestChannel = call.receiveChannel()
     val msgRequestCodec = codec.codec(handler.methodSpec.requestClass)
     val msgResponseCodec = codec.codec(handler.methodSpec.responseClass)
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
 
     val outboundQueue = Channel<ByteArray>(Channel.UNLIMITED)
     val readyToCommit = CompletableDeferred<Unit>()
@@ -719,6 +755,9 @@ private suspend fun handleBidiStream(
 
         readyToCommit.await()
         writeStreamResponseHeaders(call, ctx)
+        if (outPool != null) {
+            call.response.headers.append(protocol.compressionHeader, outPool.name(), safeOnly = false)
+        }
 
         val ct = ContentType.parse(requestContentType)
         val trailerHeadersRef = java.util.concurrent.atomic.AtomicReference<Headers>(Headers.Empty)
@@ -728,7 +767,9 @@ private suspend fun handleBidiStream(
                 getTrailers = { trailerHeadersRef.get() },
                 writeBody = { responseChannel ->
                     for (payload in outboundQueue) {
-                        responseChannel.writeFully(encodeEnvelope(0, payload))
+                        responseChannel.writeFully(
+                            encodeOutboundEnvelope(0, payload, outPool, opts.compressMinBytes),
+                        )
                         responseChannel.flush()
                     }
                     handlerJob.await()
