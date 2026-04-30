@@ -90,6 +90,7 @@ internal fun runBlockingMain(
 
     val registry = buildConformanceRegistry()
 
+    val maxReceiveSize = request.messageReceiveLimit
     val server = if (request.useTls) {
         val keyStore = buildServerKeyStore(
             request.serverCreds.cert.toByteArray(),
@@ -112,12 +113,12 @@ internal fun runBlockingMain(
                 enableH2c = false
             },
             module = {
-                connectRpc(registry)
+                connectRpc(registry, maxReceiveMessageSize = maxReceiveSize)
             },
         )
     } else {
         embeddedServer(Netty, port = 0, host = "127.0.0.1") {
-            connectRpc(registry)
+            connectRpc(registry, maxReceiveMessageSize = maxReceiveSize)
         }
     }
     server.start(wait = false)

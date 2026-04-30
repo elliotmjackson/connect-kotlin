@@ -88,16 +88,24 @@ private val COMPRESSION_POOLS: Map<String, CompressionPool> = mapOf(
  * Mounts a Connect/gRPC-Web server into a Ktor [Application]. gRPC over HTTP/2
  * is a follow-up.
  */
-fun Application.connectRpc(registry: HandlerRegistry) {
+fun Application.connectRpc(
+    registry: HandlerRegistry,
+    /**
+     * Maximum size in bytes of any single request message after decompression.
+     * Zero means unlimited. Mirrors `ServerCompatRequest.message_receive_limit`
+     * from the conformance suite.
+     */
+    maxReceiveMessageSize: Int = 0,
+) {
     routing {
         for (procedure in registry.procedures) {
             post("/$procedure") {
-                dispatch(call, registry, procedure)
+                dispatch(call, registry, procedure, maxReceiveMessageSize)
             }
             val handler = registry.find(procedure)
             if (handler != null && handler.methodSpec.idempotency == Idempotency.NO_SIDE_EFFECTS) {
                 get("/$procedure") {
-                    dispatchConnectGet(call, registry, procedure)
+                    dispatchConnectGet(call, registry, procedure, maxReceiveMessageSize)
                 }
             }
         }
@@ -153,6 +161,7 @@ private suspend fun dispatch(
     call: ApplicationCall,
     registry: HandlerRegistry,
     procedure: String,
+    maxReceiveMessageSize: Int,
 ) {
     val contentType = call.request.contentType().withoutParameters().toString()
     val (codecName, protocol) = when (contentType) {
@@ -179,9 +188,9 @@ private suspend fun dispatch(
         return
     }
     if (protocol == null) {
-        handleConnectUnary(call, registry, procedure, codec, contentType)
+        handleConnectUnary(call, registry, procedure, codec, contentType, maxReceiveMessageSize)
     } else {
-        handleStreaming(call, registry, procedure, codec, contentType, protocol)
+        handleStreaming(call, registry, procedure, codec, contentType, protocol, maxReceiveMessageSize)
     }
 }
 
@@ -191,6 +200,7 @@ private suspend fun handleConnectUnary(
     procedure: String,
     codec: SerializationStrategy,
     requestContentType: String,
+    maxReceiveMessageSize: Int,
 ) {
     val handler = registry.find(procedure)
     if (handler == null || handler.methodSpec.streamType != StreamType.UNARY) {
@@ -234,6 +244,17 @@ private suspend fun handleConnectUnary(
     } else {
         rawBytes
     }
+    if (maxReceiveMessageSize > 0 && requestBytes.size > maxReceiveMessageSize) {
+        respondConnectUnaryError(
+            call,
+            ctx,
+            ConnectException(
+                Code.RESOURCE_EXHAUSTED,
+                "message size ${requestBytes.size} exceeds limit of $maxReceiveMessageSize",
+            ),
+        )
+        return
+    }
     val request = try {
         codec.codec(unary.methodSpec.requestClass).deserialize(Buffer().write(requestBytes))
     } catch (ex: Exception) {
@@ -268,6 +289,7 @@ private suspend fun handleStreaming(
     codec: SerializationStrategy,
     requestContentType: String,
     protocol: StreamingProtocol,
+    maxReceiveMessageSize: Int,
 ) {
     val handler = registry.find(procedure)
     if (handler == null) {
@@ -314,22 +336,22 @@ private suspend fun handleStreaming(
             }
             @Suppress("UNCHECKED_CAST")
             val uh = handler as UnaryHandler<Any, Any>
-            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool)
+            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
         }
         StreamType.SERVER -> {
             @Suppress("UNCHECKED_CAST")
             val sh = handler as ServerStreamHandler<Any, Any>
-            handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool)
+            handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
         }
         StreamType.CLIENT -> {
             @Suppress("UNCHECKED_CAST")
             val ch = handler as ClientStreamHandler<Any, Any>
-            handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool)
+            handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
         }
         StreamType.BIDI -> {
             @Suppress("UNCHECKED_CAST")
             val bh = handler as BidiStreamHandler<Any, Any>
-            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool)
+            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool, maxReceiveMessageSize)
         }
     }
 }
@@ -342,11 +364,25 @@ private suspend fun handleUnaryAsStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
+    maxReceiveMessageSize: Int,
 ) {
     val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol, pool)
         ?: return
     if (error != null) {
         respondStreamError(call, requestContentType, ctx, protocol, error)
+        return
+    }
+    if (maxReceiveMessageSize > 0 && env.payload.size > maxReceiveMessageSize) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            protocol,
+            ConnectException(
+                Code.RESOURCE_EXHAUSTED,
+                "message size ${env.payload.size} exceeds limit of $maxReceiveMessageSize",
+            ),
+        )
         return
     }
     val request = try {
@@ -387,11 +423,25 @@ private suspend fun handleServerStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
+    maxReceiveMessageSize: Int,
 ) {
     val (env, error) = readSingleStreamEnvelope(call, requestContentType, ctx, protocol, pool)
         ?: return
     if (error != null) {
         respondStreamError(call, requestContentType, ctx, protocol, error)
+        return
+    }
+    if (maxReceiveMessageSize > 0 && env.payload.size > maxReceiveMessageSize) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            protocol,
+            ConnectException(
+                Code.RESOURCE_EXHAUSTED,
+                "message size ${env.payload.size} exceeds limit of $maxReceiveMessageSize",
+            ),
+        )
         return
     }
     val request = try {
@@ -439,8 +489,9 @@ private suspend fun handleClientStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
+    maxReceiveMessageSize: Int,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool)
+    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, maxReceiveMessageSize)
         ?: return
 
     val inStream = BufferedClientMessageStream(messages, ctx.requestHeaders)
@@ -468,8 +519,9 @@ private suspend fun handleBidiStream(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
+    maxReceiveMessageSize: Int,
 ) {
-    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool)
+    val messages = readAllRequestEnvelopes(call, handler.methodSpec.requestClass, codec, ctx, requestContentType, protocol, pool, maxReceiveMessageSize)
         ?: return
 
     val outbound = mutableListOf<ByteArray>()
@@ -618,6 +670,7 @@ private suspend fun readAllRequestEnvelopes(
     requestContentType: String,
     protocol: StreamingProtocol,
     pool: CompressionPool?,
+    maxReceiveMessageSize: Int,
 ): List<Any>? {
     val requestBytes = call.receiveChannel().toByteArray()
     val buffer = Buffer().write(requestBytes)
@@ -640,6 +693,19 @@ private suspend fun readAllRequestEnvelopes(
                     )
                     return null
                 }
+            if (maxReceiveMessageSize > 0 && decoded.payload.size > maxReceiveMessageSize) {
+                respondStreamError(
+                    call,
+                    requestContentType,
+                    ctx,
+                    protocol,
+                    ConnectException(
+                        Code.RESOURCE_EXHAUSTED,
+                        "message size ${decoded.payload.size} exceeds limit of $maxReceiveMessageSize",
+                    ),
+                )
+                return null
+            }
             messages += msgCodec.deserialize(Buffer().write(decoded.payload))
         }
     } catch (ex: ConnectException) {
@@ -697,6 +763,7 @@ private suspend fun dispatchConnectGet(
     call: ApplicationCall,
     registry: HandlerRegistry,
     procedure: String,
+    maxReceiveMessageSize: Int,
 ) {
     val handler = registry.find(procedure) as? UnaryHandler<*, *>
     if (handler == null) {
@@ -793,6 +860,17 @@ private suspend fun dispatchConnectGet(
         rawBytes
     }
 
+    if (maxReceiveMessageSize > 0 && decompressed.size > maxReceiveMessageSize) {
+        respondConnectUnaryError(
+            call,
+            ctx = null,
+            ConnectException(
+                Code.RESOURCE_EXHAUSTED,
+                "message size ${decompressed.size} exceeds limit of $maxReceiveMessageSize",
+            ),
+        )
+        return
+    }
     @Suppress("UNCHECKED_CAST")
     val unary = handler as UnaryHandler<Any, Any>
     val request = try {
