@@ -45,8 +45,12 @@ import com.connectrpc.server.UnaryHandler
 import com.connectrpc.extensions.GoogleJavaJSONStrategy
 import com.connectrpc.extensions.GoogleJavaProtobufStrategy
 import com.connectrpc.server.ktor.connectRpc
+import com.google.protobuf.ByteString
+import io.ktor.server.engine.applicationEnvironment
 import io.ktor.server.engine.embeddedServer
+import io.ktor.server.engine.sslConnector
 import io.ktor.server.netty.Netty
+import io.ktor.server.netty.NettyApplicationEngine
 import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
@@ -65,18 +69,54 @@ internal fun runBlockingMain(
 ) {
     val request = readServerCompatRequest(input)
     if (request.httpVersion != HTTPVersion.HTTP_VERSION_1) {
-        System.err.println("milestone-1 server only supports HTTP_VERSION_1, got ${request.httpVersion}")
+        System.err.println("server currently only supports HTTP_VERSION_1, got ${request.httpVersion}")
         exitProcess(1)
     }
-    if (request.useTls) {
-        System.err.println("milestone-1 server does not support TLS")
-        exitProcess(1)
+
+    val tlsCertPem: ByteArray? = if (request.useTls) {
+        val creds = request.serverCreds
+        if (creds.cert.isEmpty || creds.key.isEmpty) {
+            System.err.println("use_tls=true but server_creds is missing cert/key")
+            exitProcess(1)
+        }
+        creds.cert.toByteArray()
+    } else {
+        null
     }
 
     val registry = buildConformanceRegistry()
 
-    val server = embeddedServer(Netty, port = 0, host = "127.0.0.1") {
-        connectRpc(registry)
+    val server = if (request.useTls) {
+        val keyStore = buildServerKeyStore(
+            request.serverCreds.cert.toByteArray(),
+            request.serverCreds.key.toByteArray(),
+        )
+        embeddedServer(
+            factory = Netty,
+            environment = applicationEnvironment { },
+            configure = {
+                sslConnector(
+                    keyStore = keyStore,
+                    keyAlias = TLS_KEY_ALIAS,
+                    keyStorePassword = { TLS_KEY_PASSWORD },
+                    privateKeyPassword = { TLS_KEY_PASSWORD },
+                ) {
+                    host = "127.0.0.1"
+                    port = 0
+                }
+                // Stage 1: HTTP/1 + TLS only. ALPN should advertise http/1.1
+                // by default with enableHttp2 false.
+                enableHttp2 = false
+                enableH2c = false
+            },
+            module = {
+                connectRpc(registry)
+            },
+        )
+    } else {
+        embeddedServer(Netty, port = 0, host = "127.0.0.1") {
+            connectRpc(registry)
+        }
     }
     server.start(wait = false)
 
@@ -84,13 +124,13 @@ internal fun runBlockingMain(
         server.engine.resolvedConnectors().first().port
     }
 
-    writeServerCompatResponse(
-        output,
-        ServerCompatResponse.newBuilder()
-            .setHost("127.0.0.1")
-            .setPort(port)
-            .build(),
-    )
+    val responseBuilder = ServerCompatResponse.newBuilder()
+        .setHost("127.0.0.1")
+        .setPort(port)
+    if (tlsCertPem != null) {
+        responseBuilder.pemCert = ByteString.copyFrom(tlsCertPem)
+    }
+    writeServerCompatResponse(output, responseBuilder.build())
 
     Runtime.getRuntime().addShutdownHook(
         Thread {

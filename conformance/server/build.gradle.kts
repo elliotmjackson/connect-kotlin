@@ -45,4 +45,5 @@ dependencies {
     implementation(libs.protobuf.java)
     implementation(libs.protobuf.kotlin)
     implementation(libs.okio.core)
+    implementation(libs.okhttp.tls)
 }

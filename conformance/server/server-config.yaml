@@ -18,7 +18,7 @@ features:
     - STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM
     # full-duplex bidi requires HTTP/2; not supported yet
   supportsHalfDuplexBidiOverHttp1: true
-  supportsTls: false
+  supportsTls: true
   supportsTlsClientCerts: false
   supportsMessageReceiveLimit: false
   supportsConnectGet: false
