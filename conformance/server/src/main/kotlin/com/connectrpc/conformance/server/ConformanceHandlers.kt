@@ -22,6 +22,8 @@ import com.connectrpc.ErrorDetailParser
 import com.connectrpc.Idempotency
 import com.connectrpc.MethodSpec
 import com.connectrpc.StreamType
+import com.connectrpc.conformance.v1.BidiStreamRequest
+import com.connectrpc.conformance.v1.BidiStreamResponse
 import com.connectrpc.conformance.v1.ClientStreamRequest
 import com.connectrpc.conformance.v1.ClientStreamResponse
 import com.connectrpc.conformance.v1.ConformancePayload
@@ -34,6 +36,8 @@ import com.connectrpc.conformance.v1.StreamResponseDefinition
 import com.connectrpc.conformance.v1.UnaryRequest
 import com.connectrpc.conformance.v1.UnaryResponse
 import com.connectrpc.conformance.v1.UnaryResponseDefinition
+import com.connectrpc.server.BidiStream
+import com.connectrpc.server.BidiStreamHandler
 import com.connectrpc.server.ClientMessageStream
 import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
@@ -253,6 +257,81 @@ internal class ConformanceClientStreamHandler :
         return ClientStreamResponse.newBuilder()
             .setPayload(payloadBuilder.setData(def.responseData).build())
             .build()
+    }
+}
+
+internal class ConformanceBidiStreamHandler :
+    BidiStreamHandler<BidiStreamRequest, BidiStreamResponse> {
+    override val methodSpec = MethodSpec(
+        "$SERVICE_PATH/BidiStream",
+        BidiStreamRequest::class,
+        BidiStreamResponse::class,
+        StreamType.BIDI,
+    )
+
+    override suspend fun handle(
+        stream: BidiStream<BidiStreamRequest, BidiStreamResponse>,
+        ctx: HandlerContext,
+    ) {
+        val received = mutableListOf<BidiStreamRequest>()
+        var def: StreamResponseDefinition? = null
+        var fullDuplex = false
+        while (true) {
+            val msg = stream.receive() ?: break
+            if (received.isEmpty()) {
+                if (msg.hasResponseDefinition()) def = msg.responseDefinition
+                fullDuplex = msg.fullDuplex
+            }
+            received += msg
+        }
+
+        // Half-duplex only over HTTP/1; full-duplex would require true streaming
+        // and is filtered out by server-config.yaml.
+        if (fullDuplex) {
+            throw ConnectException(
+                Code.UNIMPLEMENTED,
+                "full-duplex bidi streams require HTTP/2 (not supported)",
+            )
+        }
+
+        val requestInfo = buildRequestInfo(ctx, received.map { packAny(it) })
+
+        if (def == null) return
+
+        for (h in def.responseHeadersList) {
+            ctx.responseHeaders.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+        }
+        for (h in def.responseTrailersList) {
+            ctx.responseTrailers.getOrPut(h.name) { mutableListOf() }.addAll(h.valueList)
+        }
+
+        for ((index, data) in def.responseDataList.withIndex()) {
+            if (def.responseDelayMs > 0) {
+                delay(def.responseDelayMs.toLong())
+            }
+            val payloadBuilder = ConformancePayload.newBuilder().setData(data)
+            if (index == 0) {
+                payloadBuilder.setRequestInfo(requestInfo)
+            }
+            stream.send(
+                BidiStreamResponse.newBuilder().setPayload(payloadBuilder.build()).build(),
+            )
+        }
+
+        if (def.hasError()) {
+            val err = def.error
+            val code = Code.fromValue(err.code.number) ?: Code.UNKNOWN
+            val message = if (err.hasMessage()) err.message else null
+            val details = mutableListOf<ConnectErrorDetail>()
+            if (def.responseDataList.isEmpty()) {
+                details += packAny(requestInfo).toConnectErrorDetail()
+            }
+            for (d in err.detailsList) {
+                details += d.toConnectErrorDetail()
+            }
+            throw ConnectException(code = code, message = message)
+                .withErrorDetails(NoopErrorDetailParser, details)
+        }
     }
 }
 

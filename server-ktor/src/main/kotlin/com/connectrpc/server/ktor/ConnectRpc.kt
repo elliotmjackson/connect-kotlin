@@ -21,6 +21,8 @@ import com.connectrpc.ConnectException
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.Headers
+import com.connectrpc.server.BidiStream
+import com.connectrpc.server.BidiStreamHandler
 import com.connectrpc.server.ClientMessageStream
 import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
@@ -181,6 +183,11 @@ private suspend fun handleConnectStream(
             val ch = handler as ClientStreamHandler<Any, Any>
             handleClientStream(call, ch, codec, requestContentType, procedure)
         }
+        StreamType.BIDI -> {
+            @Suppress("UNCHECKED_CAST")
+            val bh = handler as BidiStreamHandler<Any, Any>
+            handleBidiStream(call, bh, codec, requestContentType, procedure)
+        }
         else -> respondStreamError(
             call,
             requestContentType,
@@ -256,6 +263,79 @@ private class BufferedClientMessageStream<Req : Any>(
 ) : ClientMessageStream<Req> {
     private val iterator = messages.iterator()
     override suspend fun receive(): Req? = if (iterator.hasNext()) iterator.next() else null
+}
+
+private suspend fun handleBidiStream(
+    call: ApplicationCall,
+    handler: BidiStreamHandler<Any, Any>,
+    codec: SerializationStrategy,
+    requestContentType: String,
+    procedure: String,
+) {
+    val ctx = newHandlerContext(call, procedure)
+    val requestBytes = call.receiveChannel().toByteArray()
+    val buffer = Buffer().write(requestBytes)
+    val messages = mutableListOf<Any>()
+    val msgCodec = codec.codec(handler.methodSpec.requestClass)
+    try {
+        while (true) {
+            val env = decodeNextEnvelope(buffer) ?: break
+            messages += msgCodec.deserialize(Buffer().write(env.payload))
+        }
+    } catch (ex: ConnectException) {
+        respondStreamError(call, requestContentType, ctx, ex)
+        return
+    } catch (ex: Exception) {
+        respondStreamError(
+            call,
+            requestContentType,
+            ctx,
+            ConnectException(Code.INVALID_ARGUMENT, "could not decode request: ${ex.message}"),
+        )
+        return
+    }
+
+    // Half-duplex over HTTP/1: the handler reads all requests, then the
+    // adapter writes all buffered responses. Full-duplex requires HTTP/2.
+    val outbound = mutableListOf<ByteArray>()
+    val bidi = BufferedBidiStream<Any, Any>(messages, ctx.requestHeaders) { message ->
+        outbound += codec.codec(handler.methodSpec.responseClass)
+            .serialize(message)
+            .readByteArray()
+    }
+
+    val handlerError = try {
+        handler.handle(bidi, ctx)
+        null
+    } catch (ex: ConnectException) {
+        ex
+    }
+
+    writeStreamResponseHeaders(call, ctx)
+    call.respondBytesWriter(
+        contentType = ContentType.parse(requestContentType),
+        status = HttpStatusCode.OK,
+    ) {
+        for (payload in outbound) {
+            writeFully(encodeEnvelope(0, payload))
+        }
+        writeFully(
+            encodeEnvelope(
+                ENVELOPE_FLAG_END_STREAM,
+                endStreamJsonPayload(handlerError, ctx.responseTrailers.mapValues { it.value.toList() }),
+            ),
+        )
+    }
+}
+
+private class BufferedBidiStream<Req : Any, Res : Any>(
+    messages: List<Req>,
+    override val headers: Headers,
+    private val onSend: suspend (Res) -> Unit,
+) : BidiStream<Req, Res> {
+    private val iterator = messages.iterator()
+    override suspend fun receive(): Req? = if (iterator.hasNext()) iterator.next() else null
+    override suspend fun send(message: Res) = onSend(message)
 }
 
 private suspend fun handleServerStream(

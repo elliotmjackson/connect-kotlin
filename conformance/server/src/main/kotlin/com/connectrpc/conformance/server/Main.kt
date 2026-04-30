@@ -109,13 +109,7 @@ private fun buildConformanceRegistry(): HandlerRegistry =
         .register(ConformanceUnaryHandler())
         .register(ConformanceServerStreamHandler())
         .register(ConformanceClientStreamHandler())
-        .register(
-            unimplementedBidi(
-                "$SERVICE_PATH/BidiStream",
-                BidiStreamRequest::class,
-                BidiStreamResponse::class,
-            ),
-        )
+        .register(ConformanceBidiStreamHandler())
         .register(
             unimplemented(
                 "$SERVICE_PATH/Unimplemented",

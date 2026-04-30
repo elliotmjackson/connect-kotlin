@@ -14,8 +14,9 @@ features:
     - STREAM_TYPE_UNARY
     - STREAM_TYPE_SERVER_STREAM
     - STREAM_TYPE_CLIENT_STREAM
-    # bidi streams require HTTP/2; not supported in milestone-1
-  supportsHalfDuplexBidiOverHttp1: false
+    - STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM
+    # full-duplex bidi requires HTTP/2; not supported yet
+  supportsHalfDuplexBidiOverHttp1: true
   supportsTls: false
   supportsTlsClientCerts: false
   supportsMessageReceiveLimit: false
