@@ -71,7 +71,11 @@ import io.ktor.server.routing.routing
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeout
 import okio.Buffer
 
@@ -566,29 +570,67 @@ private suspend fun handleServerStream(
         return
     }
 
-    val outbound = mutableListOf<ByteArray>()
-    val outStream = object : ServerMessageStream<Any> {
-        override suspend fun send(message: Any) {
-            outbound += codec.codec(handler.methodSpec.responseClass)
-                .serialize(message)
-                .readByteArray()
-        }
-    }
+    // Real-time streaming: handler runs concurrently with response writer.
+    // The handler's send() pushes encoded envelopes into a channel; the
+    // response writer drains them as they arrive. Headers are committed at
+    // the moment the handler either calls send() for the first time or
+    // returns/throws — so the conformance pattern of setting headers from
+    // the request's response_definition before the first send works.
+    val responseCodec = codec.codec(handler.methodSpec.responseClass)
+    val outboundQueue = Channel<ByteArray>(Channel.UNLIMITED)
+    val readyToCommit = CompletableDeferred<Unit>()
+    val handlerErrorRef = java.util.concurrent.atomic.AtomicReference<ConnectException?>(null)
 
-    val handlerError = try {
-        invokeWithTimeout(ctx.timeoutMs) { handler.handle(request, ctx, outStream) }
-        null
-    } catch (ex: TimeoutCancellationException) {
-        ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
-    } catch (ex: ConnectException) {
-        ex
-    }
-
-    writeStreamResponseHeaders(call, ctx)
-    respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
-        for (payload in outbound) {
-            writeFully(encodeEnvelope(0, payload))
+    coroutineScope {
+        val handlerJob = async {
+            val outStream = object : ServerMessageStream<Any> {
+                override suspend fun send(message: Any) {
+                    readyToCommit.complete(Unit)
+                    outboundQueue.send(responseCodec.serialize(message).readByteArray())
+                }
+            }
+            try {
+                invokeWithTimeout(ctx.timeoutMs) { handler.handle(request, ctx, outStream) }
+            } catch (ex: TimeoutCancellationException) {
+                handlerErrorRef.set(ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
+            } catch (ex: ConnectException) {
+                handlerErrorRef.set(ex)
+            } finally {
+                readyToCommit.complete(Unit)
+                outboundQueue.close()
+            }
         }
+
+        readyToCommit.await()
+        writeStreamResponseHeaders(call, ctx)
+
+        val ct = ContentType.parse(requestContentType)
+        val trailerHeadersRef = java.util.concurrent.atomic.AtomicReference<Headers>(Headers.Empty)
+        call.respond(
+            FramedStreamingContent(
+                ct = ct,
+                getTrailers = { trailerHeadersRef.get() },
+                writeBody = { responseChannel ->
+                    for (payload in outboundQueue) {
+                        responseChannel.writeFully(encodeEnvelope(0, payload))
+                        responseChannel.flush()
+                    }
+                    handlerJob.await()
+                    val userTrailers = ctx.responseTrailers.mapValues { it.value.toList() }
+                    val err = handlerErrorRef.get()
+                    if (protocol.usesHttpTrailers) {
+                        trailerHeadersRef.set(headersFromPairs(protocol.buildHttpTrailers(err, userTrailers)))
+                    } else {
+                        responseChannel.writeFully(
+                            encodeEnvelope(
+                                protocol.trailerEnvelopeFlag,
+                                protocol.buildTrailerPayload(err, userTrailers),
+                            ),
+                        )
+                    }
+                },
+            ),
+        )
     }
 }
 

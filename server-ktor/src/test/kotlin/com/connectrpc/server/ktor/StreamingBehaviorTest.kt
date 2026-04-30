@@ -49,7 +49,6 @@ class StreamingBehaviorTest {
      * flushes them in one go after `handle()` returns.
      */
     @Test
-    @Ignore("TDD target: server-stream currently buffers all sends; needs real-time streaming I/O")
     fun serverStreamEmitsIncrementally() {
         val handler = object : ServerStreamHandler<TestMessage, TestMessage> {
             override val methodSpec = MethodSpec(
@@ -86,12 +85,9 @@ class StreamingBehaviorTest {
             val arrivals = mutableListOf<Long>()
             client.newCall(request).execute().use { response ->
                 val source = response.body!!.source()
-                val buffer = Buffer()
                 val start = System.currentTimeMillis()
-                while (true) {
-                    val available = source.read(buffer, 9) // 5 header + at least 4 small payload
-                    if (available <= 0) break
-                    val env = readEnvelope(buffer) ?: break
+                while (!source.exhausted()) {
+                    val env = readEnvelope(source) ?: break
                     arrivals += System.currentTimeMillis() - start
                     if ((env.flags and 0x02) != 0) break // EndStream envelope
                 }
