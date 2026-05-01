@@ -56,21 +56,36 @@ open class ConformanceServerApp {
      * Tomcat's HTTP/2 anti-DoS rejects the conformance suite's tight loops
      * with ENHANCE_YOUR_CALM. The conformance traffic is legitimate; relax
      * the overhead thresholds so the suite can run.
+     *
+     * Also wires h2c when `connectrpc.h2c=true` is set — adds an
+     * [Http2Protocol] upgrade protocol on the connector so Tomcat accepts
+     * both prior-knowledge h2c (gRPC's default cleartext mode) and the
+     * HTTP/1.1 Upgrade dance.
      */
     @Bean
-    open fun http2OverheadRelaxer(): WebServerFactoryCustomizer<TomcatServletWebServerFactory> =
+    open fun http2Customizer(
+        @org.springframework.beans.factory.annotation.Value("\${connectrpc.h2c:false}")
+        h2c: Boolean,
+    ): WebServerFactoryCustomizer<TomcatServletWebServerFactory> =
         WebServerFactoryCustomizer { factory ->
             factory.addConnectorCustomizers({ connector ->
+                if (h2c) {
+                    val protocol = Http2Protocol()
+                    relaxOverhead(protocol)
+                    connector.addUpgradeProtocol(protocol)
+                }
                 for (upgrade in connector.findUpgradeProtocols()) {
-                    if (upgrade is Http2Protocol) {
-                        upgrade.overheadCountFactor = 0
-                        upgrade.overheadDataThreshold = 0
-                        upgrade.overheadWindowUpdateThreshold = 0
-                        upgrade.overheadContinuationThreshold = 0
-                    }
+                    if (upgrade is Http2Protocol) relaxOverhead(upgrade)
                 }
             })
         }
+
+    private fun relaxOverhead(p: Http2Protocol) {
+        p.overheadCountFactor = 0
+        p.overheadDataThreshold = 0
+        p.overheadWindowUpdateThreshold = 0
+        p.overheadContinuationThreshold = 0
+    }
 }
 
 fun main(args: Array<String>) {
@@ -93,10 +108,8 @@ fun main(args: Array<String>) {
     )
 
     if (wantHttp2 && !request.useTls) {
-        // h2c (HTTP/2 cleartext) needs a Tomcat upgrade-protocol customizer;
-        // not yet wired in this binary. TLS HTTP/2 is supported below.
-        System.err.println("HTTP/2 cleartext (h2c) not yet supported in :conformance:server-springboot")
-        exitProcess(1)
+        // h2c — handled by ConformanceServerApp.h2cConnectorCustomizer below.
+        props["connectrpc.h2c"] = true
     }
 
     var tlsCertPem: ByteArray? = null
