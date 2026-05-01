@@ -27,10 +27,12 @@ class HandlerRegistry private constructor(
     private val handlers: Map<String, Handler<*, *>>,
     private val codecs: Map<String, SerializationStrategy>,
     /**
-     * Interceptors in registration order — the first registered is outermost
-     * (sees the request first, response last).
+     * Global interceptors in registration order — the first registered is
+     * outermost (sees the request first, response last). Apply to every
+     * procedure.
      */
     val interceptors: List<ServerInterceptor>,
+    private val perProcedureInterceptors: Map<String, List<ServerInterceptor>>,
 ) {
     /** All registered procedure paths. */
     val procedures: Set<String> get() = handlers.keys
@@ -44,15 +46,37 @@ class HandlerRegistry private constructor(
     /** Resolve a codec by serialization name (e.g. "proto", "json"). */
     fun codec(name: String): SerializationStrategy? = codecs[name]
 
+    /**
+     * Returns the per-procedure interceptors registered for [procedure], or
+     * an empty list if none. These run inside the global interceptor chain.
+     */
+    fun interceptorsFor(procedure: String): List<ServerInterceptor> =
+        perProcedureInterceptors[procedure] ?: emptyList()
+
     class Builder {
         private val handlers = mutableMapOf<String, Handler<*, *>>()
         private val codecs = mutableMapOf<String, SerializationStrategy>()
         private val interceptors = mutableListOf<ServerInterceptor>()
+        private val perProcedureInterceptors = mutableMapOf<String, MutableList<ServerInterceptor>>()
 
-        fun register(handler: Handler<*, *>): Builder = apply {
+        fun register(handler: Handler<*, *>): Builder = register(handler, emptyList())
+
+        /**
+         * Registers a handler with optional per-procedure interceptors. The
+         * per-procedure interceptors run inside the global chain — i.e.
+         * after global interceptors entered, before the handler runs, and
+         * before global interceptors exit.
+         */
+        fun register(
+            handler: Handler<*, *>,
+            interceptors: List<ServerInterceptor>,
+        ): Builder = apply {
             val path = handler.methodSpec.path
             require(handlers.put(path, handler) == null) {
                 "duplicate handler registered for procedure $path"
+            }
+            if (interceptors.isNotEmpty()) {
+                perProcedureInterceptors.getOrPut(path) { mutableListOf() }.addAll(interceptors)
             }
         }
 
@@ -75,14 +99,19 @@ class HandlerRegistry private constructor(
             }
         }
 
-        /** Registers an interceptor. Interceptors run in the order they were added. */
+        /** Registers a global interceptor. Interceptors run in the order they were added. */
         fun interceptor(interceptor: ServerInterceptor): Builder = apply {
             interceptors += interceptor
         }
 
         fun build(): HandlerRegistry {
             require(codecs.isNotEmpty()) { "at least one codec must be registered" }
-            return HandlerRegistry(handlers.toMap(), codecs.toMap(), interceptors.toList())
+            return HandlerRegistry(
+                handlers = handlers.toMap(),
+                codecs = codecs.toMap(),
+                interceptors = interceptors.toList(),
+                perProcedureInterceptors = perProcedureInterceptors.mapValues { it.value.toList() },
+            )
         }
     }
 

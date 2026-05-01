@@ -300,7 +300,7 @@ private suspend fun handleConnectUnary(
         return
     }
     @Suppress("UNCHECKED_CAST")
-    val unary = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors)
+    val unary = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors + registry.interceptorsFor(procedure))
 
     val ctx = newHandlerContext(call, procedure)
 
@@ -477,22 +477,27 @@ private suspend fun handleStreaming(
                 return
             }
             @Suppress("UNCHECKED_CAST")
-            val uh = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors)
+            val combined = registry.interceptors + registry.interceptorsFor(procedure)
+            @Suppress("UNCHECKED_CAST")
+            val uh = (handler as UnaryHandler<Any, Any>).wrapUnary(combined)
             handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.SERVER -> {
+            val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
-            val sh = (handler as ServerStreamHandler<Any, Any>).wrapServerStream(registry.interceptors)
+            val sh = (handler as ServerStreamHandler<Any, Any>).wrapServerStream(combined)
             handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.CLIENT -> {
+            val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
-            val ch = (handler as ClientStreamHandler<Any, Any>).wrapClientStream(registry.interceptors)
+            val ch = (handler as ClientStreamHandler<Any, Any>).wrapClientStream(combined)
             handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.BIDI -> {
+            val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
-            val bh = (handler as BidiStreamHandler<Any, Any>).wrapBidi(registry.interceptors)
+            val bh = (handler as BidiStreamHandler<Any, Any>).wrapBidi(combined)
             handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
     }
@@ -1173,7 +1178,7 @@ private suspend fun dispatchConnectGet(
         return
     }
     @Suppress("UNCHECKED_CAST")
-    val unary = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors)
+    val unary = (handler as UnaryHandler<Any, Any>).wrapUnary(registry.interceptors + registry.interceptorsFor(procedure))
     val request = try {
         codec.codec(unary.methodSpec.requestClass).deserialize(Buffer().write(decompressed))
     } catch (ex: Exception) {

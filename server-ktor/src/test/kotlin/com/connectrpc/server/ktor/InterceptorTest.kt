@@ -26,6 +26,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.Test
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Verifies that registered [ServerInterceptor]s wrap the handler invocation
@@ -151,5 +152,61 @@ class InterceptorTest {
         assertThat(order).containsExactly(
             "A-in", "B-in", "C-in", "handler", "C-out", "B-out", "A-out",
         )
+    }
+
+    @Test
+    fun perProcedureInterceptorOnlyAppliesToRegisteredProcedure() {
+        val interceptedA = AtomicInteger(0)
+        val interceptedB = AtomicInteger(0)
+
+        fun counting(counter: AtomicInteger): ServerInterceptor = object : ServerInterceptor {
+            override fun <Req : Any, Res : Any> wrapUnary(
+                next: UnaryHandler<Req, Res>,
+            ): UnaryHandler<Req, Res> = object : UnaryHandler<Req, Res> {
+                override val methodSpec = next.methodSpec
+                override suspend fun handle(request: Req, ctx: HandlerContext): Res {
+                    counter.incrementAndGet()
+                    return next.handle(request, ctx)
+                }
+            }
+        }
+
+        fun handler(path: String): UnaryHandler<TestMessage, TestMessage> =
+            object : UnaryHandler<TestMessage, TestMessage> {
+                override val methodSpec = MethodSpec(
+                    path,
+                    TestMessage::class,
+                    TestMessage::class,
+                    StreamType.UNARY,
+                )
+
+                override suspend fun handle(request: TestMessage, ctx: HandlerContext): TestMessage =
+                    TestMessage("ok")
+            }
+
+        val registry = HandlerRegistry.builder()
+            .codec(TestSerializationStrategy)
+            .register(handler("test.v1.TestService/A"), listOf(counting(interceptedA)))
+            .register(handler("test.v1.TestService/B"))
+            .build()
+
+        TestServer.start(registry).use { server ->
+            fun hit(path: String) {
+                val req = Request.Builder()
+                    .url("${server.baseUrl}/$path")
+                    .header("Content-Type", "application/proto")
+                    .post(ByteArray(0).toRequestBody("application/proto".toMediaType()))
+                    .build()
+                newTestClient().newCall(req).execute().use { it.close() }
+            }
+            hit("test.v1.TestService/A")
+            hit("test.v1.TestService/B")
+            hit("test.v1.TestService/A")
+        }
+
+        // Procedure A's per-procedure interceptor saw exactly its own calls.
+        assertThat(interceptedA.get()).isEqualTo(2)
+        // Procedure B's counter is irrelevant (no interceptor); just sanity.
+        assertThat(interceptedB.get()).isEqualTo(0)
     }
 }
