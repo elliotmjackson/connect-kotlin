@@ -95,30 +95,54 @@ private const val CONNECT_PROTOCOL_VERSION_VALUE = "1"
 
 
 /**
- * Mounts a Connect/gRPC-Web server into a Ktor [Application]. gRPC over HTTP/2
- * is a follow-up.
+ * Mounts a Connect / gRPC / gRPC-Web server onto a Ktor [Application],
+ * wiring every procedure in [registry] to a route at `/${procedure.path}`.
+ *
+ * Supports the three Connect-family protocols, both `proto` and `json`
+ * codecs, gzip and deflate compression in either direction, all four
+ * stream types (unary, server, client, bidi), and Connect-GET for
+ * idempotent unary procedures. The wire protocol is selected from the
+ * request `Content-Type`.
+ *
+ * Example:
+ * ```
+ * embeddedServer(Netty, port = 8080) {
+ *     val registry = HandlerRegistry.builder()
+ *         .codec(GoogleJavaProtobufStrategy())
+ *         .codec(GoogleJavaJSONStrategy())
+ *         .interceptor(authInterceptor)
+ *         .registerAll(ElizaServiceImpl().handlers())
+ *         .build()
+ *     connectRpc(registry, maxReceiveMessageSize = 4 * 1024 * 1024)
+ * }.start(wait = true)
+ * ```
+ *
+ * Notes for production:
+ * - Configure the engine for HTTP/2 if you need full-duplex bidi or gRPC
+ *   over HTTP/2 — Connect and gRPC-Web also work over HTTP/1.1.
+ * - When the application is stopped, in-flight handler coroutines are
+ *   cancelled cleanly via the underlying channel's close future.
+ * - Handler exceptions are mapped to Connect errors: [ConnectException]
+ *   passes through verbatim; everything else becomes
+ *   [com.connectrpc.Code.UNKNOWN].
+ *
+ * @param registry the procedures, codecs, and interceptors to dispatch.
+ * @param maxReceiveMessageSize Maximum size in bytes of any single request
+ *     message after decompression. Zero means unlimited.
+ * @param requireConnectProtocolHeader If true, Connect-protocol POSTs
+ *     missing `Connect-Protocol-Version: 1` are rejected with
+ *     INVALID_ARGUMENT. Off by default per the Connect spec (the header
+ *     is recommended but not required for backwards compatibility).
+ *     Mirrors connect-go's `RequireConnectProtocolHeader` handler option.
+ * @param compressMinBytes Responses whose serialized message size meets
+ *     or exceeds this threshold are eligible for compression when the
+ *     client advertises a supported encoding. Set to [Int.MAX_VALUE] to
+ *     disable outbound compression.
  */
 fun Application.connectRpc(
     registry: HandlerRegistry,
-    /**
-     * Maximum size in bytes of any single request message after decompression.
-     * Zero means unlimited. Mirrors `ServerCompatRequest.message_receive_limit`
-     * from the conformance suite.
-     */
     maxReceiveMessageSize: Int = 0,
-    /**
-     * If true, Connect protocol POSTs missing `Connect-Protocol-Version: 1`
-     * are rejected with INVALID_ARGUMENT. Off by default per the Connect spec
-     * (header is recommended but not required for backwards compatibility).
-     * Mirrors connect-go's `RequireConnectProtocolHeader` handler option.
-     */
     requireConnectProtocolHeader: Boolean = false,
-    /**
-     * Responses whose serialized message size meets or exceeds this threshold
-     * are eligible for compression when the client advertises a supported
-     * encoding via Accept-Encoding (or the protocol's streaming equivalent).
-     * Set to [Int.MAX_VALUE] to disable outbound compression.
-     */
     compressMinBytes: Int = 1024,
 ) {
     val opts = ConnectRpcOptions(

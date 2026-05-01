@@ -45,7 +45,14 @@ interface ServerMessageStream<Res : Any> {
     suspend fun send(message: Res)
 }
 
-/** Bidi stream: combined client-side reads and server-side writes. */
+/**
+ * Server-side view of a bidirectional stream: combines [ClientMessageStream]
+ * reads with [ServerMessageStream] writes. Sends and receives are
+ * independent — handlers may interleave them freely (full-duplex over
+ * HTTP/2) or read-then-write (half-duplex). The transport may buffer either
+ * side; do not rely on a [send] being delivered before a subsequent
+ * [receive] returns.
+ */
 interface BidiStream<Req : Any, Res : Any> :
     ClientMessageStream<Req>,
     ServerMessageStream<Res>
