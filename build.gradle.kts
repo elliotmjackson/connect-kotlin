@@ -101,12 +101,15 @@ allprojects {
 }
 
 subprojects {
+    // Spring Boot 3 + Jakarta Servlet 6 require JVM 17 at runtime, so the
+    // server-springboot module opts out of the project-wide JVM 1.8 target.
+    val isJvm17Module = project.name == "server-springboot"
     tasks.withType<KotlinJvmCompile> {
         compilerOptions {
-            jvmTarget.set(JvmTarget.JVM_1_8)
+            jvmTarget.set(if (isJvm17Module) JvmTarget.JVM_17 else JvmTarget.JVM_1_8)
             languageVersion.set(KotlinVersion.KOTLIN_2_1)
             apiVersion.set(KotlinVersion.KOTLIN_2_1)
-            if (JavaVersion.current().isJava9Compatible && project.name != "android") {
+            if (JavaVersion.current().isJava9Compatible && project.name != "android" && !isJvm17Module) {
                 freeCompilerArgs.add("-Xjdk-release=1.8")
             }
         }
@@ -115,13 +118,15 @@ subprojects {
         val defaultArgs = listOf("-Xdoclint:none", "-Xlint:none", "-nowarn")
         if (JavaVersion.current().isJava9Compatible) {
             doFirst {
-                options.compilerArgs = listOf("--release", "8") + defaultArgs
+                val release = if (isJvm17Module) "17" else "8"
+                options.compilerArgs = listOf("--release", release) + defaultArgs
             }
         } else {
             options.compilerArgs = defaultArgs
         }
-        sourceCompatibility = JavaVersion.VERSION_1_8.toString()
-        targetCompatibility = JavaVersion.VERSION_1_8.toString()
+        val javaVersion = if (isJvm17Module) JavaVersion.VERSION_17 else JavaVersion.VERSION_1_8
+        sourceCompatibility = javaVersion.toString()
+        targetCompatibility = javaVersion.toString()
         options.encoding = Charsets.UTF_8.toString()
     }
     plugins.withId("com.vanniktech.maven.publish.base") {
