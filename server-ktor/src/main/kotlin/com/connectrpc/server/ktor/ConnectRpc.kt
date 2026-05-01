@@ -556,13 +556,17 @@ private suspend fun handleUnaryAsStream(
         null to ex
     }
 
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
     writeStreamResponseHeaders(call, ctx)
+    if (outPool != null) {
+        call.response.headers.append(protocol.compressionHeader, outPool.name(), safeOnly = false)
+    }
     respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
         if (response != null) {
             val bytes = codec.codec(handler.methodSpec.responseClass)
                 .serialize(response)
                 .readByteArray()
-            writeFully(encodeEnvelope(0, bytes))
+            writeFully(encodeOutboundEnvelope(0, bytes, outPool, opts.compressMinBytes))
         }
     }
 }
@@ -703,11 +707,15 @@ private suspend fun handleClientStream(
         null to ex
     }
 
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
     writeStreamResponseHeaders(call, ctx)
+    if (outPool != null) {
+        call.response.headers.append(protocol.compressionHeader, outPool.name(), safeOnly = false)
+    }
     respondStreaming(call, requestContentType, protocol, ctx, handlerError) {
         if (response != null) {
             val bytes = codec.codec(handler.methodSpec.responseClass).serialize(response).readByteArray()
-            writeFully(encodeEnvelope(0, bytes))
+            writeFully(encodeOutboundEnvelope(0, bytes, outPool, opts.compressMinBytes))
         }
     }
 }
