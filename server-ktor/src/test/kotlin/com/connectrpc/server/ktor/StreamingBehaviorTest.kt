@@ -16,8 +16,6 @@ package com.connectrpc.server.ktor
 
 import com.connectrpc.MethodSpec
 import com.connectrpc.StreamType
-import com.connectrpc.server.BidiStream
-import com.connectrpc.server.BidiStreamHandler
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
 import com.connectrpc.server.ServerMessageStream
@@ -28,15 +26,14 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okio.Buffer
 import org.assertj.core.api.Assertions.assertThat
-import org.junit.Ignore
 import org.junit.Test
 
 /**
- * TDD targets for streaming behaviors not yet implemented. These verify the
- * server actually streams responses (rather than buffering them) and that
- * full-duplex bidi handlers can interleave reads and writes.
- *
- * Remove [@Ignore] from a test once the corresponding feature lands.
+ * Verifies that the server actually streams responses incrementally rather
+ * than buffering them. Full-duplex bidi behavior is verified end-to-end by
+ * the conformance suite (62 cases under
+ * `STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM` against HTTP/2+TLS) — a unit-level
+ * check would need a duplex-capable HTTP/2 client we don't have here.
  */
 class StreamingBehaviorTest {
 
@@ -105,23 +102,4 @@ class StreamingBehaviorTest {
         }
     }
 
-    /**
-     * Full-duplex bidi: handler does one receive, one send, repeat. The
-     * adapter feature is implemented (handleBidiStream uses the streaming
-     * Channel + CompletableDeferred pattern; STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM
-     * is enabled in server-config.yaml; the conformance harness exercises
-     * it over HTTP/2+TLS and all 62 full-duplex test cases pass).
-     *
-     * What's still missing here is a Kotlin-level test client. OkHttp's
-     * standard request body API is one-shot; driving an interleaved
-     * send-receive flow requires either OkHttp's DuplexRequestBody (HTTP/2
-     * only) plus a TLS test fixture, or a different HTTP/2 client.
-     */
-    @Test
-    @Ignore("Feature implemented + verified by conformance; this test needs an HTTP/2 duplex client")
-    fun fullDuplexBidiInterleaves() {
-        // Placeholder body left intentionally empty until a duplex test
-        // client lands. See conformance suite (1367/1367) for end-to-end
-        // verification of the full-duplex behavior.
-    }
 }
