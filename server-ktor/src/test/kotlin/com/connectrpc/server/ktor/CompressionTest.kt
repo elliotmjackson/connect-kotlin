@@ -16,6 +16,7 @@ package com.connectrpc.server.ktor
 
 import com.connectrpc.MethodSpec
 import com.connectrpc.StreamType
+import com.connectrpc.compression.CompressionPool
 import com.connectrpc.compression.GzipCompressionPool
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
@@ -183,5 +184,76 @@ class CompressionTest {
                 assertThat(decompressed).isEqualTo(largePayload)
             }
         }
+    }
+
+    /**
+     * A user-registered [CompressionPool] should be picked up for both
+     * inbound decompression and outbound compression negotiation. The pool
+     * here uses a sentinel byte prefix (no real compression) — the test only
+     * cares that the registry routes by name end-to-end.
+     */
+    @Test
+    fun customCompressionPoolRegistration() {
+        val largePayload = ByteArray(64_000) { (it % 256).toByte() }
+        val handler = object : UnaryHandler<TestMessage, TestMessage> {
+            override val methodSpec = MethodSpec(
+                "test.v1.TestService/Echo",
+                TestMessage::class,
+                TestMessage::class,
+                StreamType.UNARY,
+            )
+
+            override suspend fun handle(request: TestMessage, ctx: HandlerContext): TestMessage =
+                TestMessage(largePayload)
+        }
+        val registry = HandlerRegistry.builder()
+            .codec(TestSerializationStrategy)
+            .compressionPool(SentinelCompressionPool)
+            .register(handler)
+            .build()
+
+        TestServer.start(registry).use { server ->
+            val req = Request.Builder()
+                .url("${server.baseUrl}/test.v1.TestService/Echo")
+                .header("Content-Type", "application/proto")
+                .header("Accept-Encoding", "sentinel")
+                .post(ByteArray(0).toRequestBody("application/proto".toMediaType()))
+                .build()
+
+            newTestClient().newCall(req).execute().use { response ->
+                assertThat(response.header("Content-Encoding")).isEqualTo("sentinel")
+                val bodyBytes = response.body!!.bytes()
+                val decoded = SentinelCompressionPool
+                    .decompress(Buffer().write(bodyBytes))
+                    .readByteArray()
+                assertThat(decoded).isEqualTo(largePayload)
+            }
+        }
+    }
+}
+
+/**
+ * Minimal custom compression pool: prepends a one-byte sentinel so we can
+ * verify the byte stream actually went through this pool's compress() and
+ * decompress(). Not a real compressor.
+ */
+private object SentinelCompressionPool : CompressionPool {
+    private const val SENTINEL: Byte = 0x42
+
+    override fun name(): String = "sentinel"
+
+    override fun compress(input: Buffer): Buffer {
+        val out = Buffer()
+        out.writeByte(SENTINEL.toInt())
+        out.writeAll(input)
+        return out
+    }
+
+    override fun decompress(input: Buffer): Buffer {
+        val first = input.readByte()
+        require(first == SENTINEL) { "expected sentinel byte, got $first" }
+        val out = Buffer()
+        out.writeAll(input)
+        return out
     }
 }

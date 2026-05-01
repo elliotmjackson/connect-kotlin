@@ -15,6 +15,9 @@
 package com.connectrpc.server
 
 import com.connectrpc.SerializationStrategy
+import com.connectrpc.compression.CompressionPool
+import com.connectrpc.compression.GzipCompressionPool
+import com.connectrpc.compression.DeflateCompressionPool
 
 /**
  * A collection of [Handler]s keyed by procedure path, plus the codecs the server
@@ -26,6 +29,7 @@ import com.connectrpc.SerializationStrategy
 class HandlerRegistry private constructor(
     private val handlers: Map<String, Handler<*, *>>,
     private val codecs: Map<String, SerializationStrategy>,
+    private val compressionPools: Map<String, CompressionPool>,
     /**
      * Global interceptors in registration order — the first registered is
      * outermost (sees the request first, response last). Apply to every
@@ -46,6 +50,12 @@ class HandlerRegistry private constructor(
     /** Resolve a codec by serialization name (e.g. "proto", "json"). */
     fun codec(name: String): SerializationStrategy? = codecs[name]
 
+    /** Resolve a compression pool by encoding name (e.g. "gzip", "deflate"). */
+    fun compressionPool(name: String): CompressionPool? = compressionPools[name]
+
+    /** All registered compression encoding names. */
+    val compressionEncodings: Set<String> get() = compressionPools.keys
+
     /**
      * Returns the per-procedure interceptors registered for [procedure], or
      * an empty list if none. These run inside the global interceptor chain.
@@ -56,6 +66,10 @@ class HandlerRegistry private constructor(
     class Builder {
         private val handlers = mutableMapOf<String, Handler<*, *>>()
         private val codecs = mutableMapOf<String, SerializationStrategy>()
+        private val compressionPools = mutableMapOf<String, CompressionPool>(
+            GzipCompressionPool.name() to GzipCompressionPool,
+            DeflateCompressionPool.name() to DeflateCompressionPool,
+        )
         private val interceptors = mutableListOf<ServerInterceptor>()
         private val perProcedureInterceptors = mutableMapOf<String, MutableList<ServerInterceptor>>()
 
@@ -104,11 +118,28 @@ class HandlerRegistry private constructor(
             interceptors += interceptor
         }
 
+        /**
+         * Registers a custom [CompressionPool] (e.g. brotli, zstd). Replaces
+         * any pool with the same name. The default registry includes gzip
+         * and deflate; call [removeDefaultCompressionPools] before adding
+         * custom ones if you want a clean slate.
+         */
+        fun compressionPool(pool: CompressionPool): Builder = apply {
+            compressionPools[pool.name()] = pool
+        }
+
+        /** Drops the default gzip + deflate pools. Useful when you want only your custom pools. */
+        fun removeDefaultCompressionPools(): Builder = apply {
+            compressionPools.remove(GzipCompressionPool.name())
+            compressionPools.remove(DeflateCompressionPool.name())
+        }
+
         fun build(): HandlerRegistry {
             require(codecs.isNotEmpty()) { "at least one codec must be registered" }
             return HandlerRegistry(
                 handlers = handlers.toMap(),
                 codecs = codecs.toMap(),
+                compressionPools = compressionPools.toMap(),
                 interceptors = interceptors.toList(),
                 perProcedureInterceptors = perProcedureInterceptors.mapValues { it.value.toList() },
             )

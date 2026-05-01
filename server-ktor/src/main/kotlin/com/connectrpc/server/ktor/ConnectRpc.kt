@@ -23,8 +23,6 @@ import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.Idempotency
 import com.connectrpc.compression.CompressionPool
-import com.connectrpc.compression.DeflateCompressionPool
-import com.connectrpc.compression.GzipCompressionPool
 import com.connectrpc.server.BidiStream
 import com.connectrpc.server.BidiStreamHandler
 import com.connectrpc.server.ClientMessageStream
@@ -95,11 +93,6 @@ private const val IDENTITY_ENCODING = "identity"
 private const val CONNECT_PROTOCOL_VERSION_HEADER = "Connect-Protocol-Version"
 private const val CONNECT_PROTOCOL_VERSION_VALUE = "1"
 
-/** Compression algorithms recognized server-side. Always includes identity. */
-private val COMPRESSION_POOLS: Map<String, CompressionPool> = mapOf(
-    GzipCompressionPool.name() to GzipCompressionPool,
-    DeflateCompressionPool.name() to DeflateCompressionPool,
-)
 
 /**
  * Mounts a Connect/gRPC-Web server into a Ktor [Application]. gRPC over HTTP/2
@@ -360,7 +353,7 @@ private suspend fun handleConnectUnary(
     val contentEncoding = call.request.headers["Content-Encoding"]
     val requestPool: CompressionPool? = when {
         contentEncoding == null || contentEncoding == IDENTITY_ENCODING -> null
-        else -> COMPRESSION_POOLS[contentEncoding] ?: run {
+        else -> registry.compressionPool(contentEncoding) ?: run {
             respondConnectUnaryError(
                 call,
                 ctx,
@@ -427,6 +420,7 @@ private suspend fun handleConnectUnary(
     val (finalBytes, encoding) = maybeCompressOutbound(
         rawResponseBytes,
         acceptEncoding = call.request.headers["Accept-Encoding"],
+        registry = registry,
         compressMinBytes = opts.compressMinBytes,
     )
     if (encoding != null) {
@@ -448,20 +442,21 @@ private suspend fun handleConnectUnary(
 private fun maybeCompressOutbound(
     bytes: ByteArray,
     acceptEncoding: String?,
+    registry: HandlerRegistry,
     compressMinBytes: Int,
 ): Pair<ByteArray, String?> {
     if (acceptEncoding == null || bytes.size < compressMinBytes) return bytes to null
-    val pool = pickPool(acceptEncoding) ?: return bytes to null
+    val pool = pickPool(acceptEncoding, registry) ?: return bytes to null
     val compressed = pool.compress(Buffer().write(bytes)).readByteArray()
     return compressed to pool.name()
 }
 
-private fun pickPool(acceptEncoding: String?): CompressionPool? {
+private fun pickPool(acceptEncoding: String?, registry: HandlerRegistry): CompressionPool? {
     if (acceptEncoding == null) return null
     val accepted = acceptEncoding.split(',')
         .map { it.substringBefore(';').trim().lowercase() }
         .filter { it.isNotEmpty() }
-    return accepted.firstNotNullOfOrNull { COMPRESSION_POOLS[it] }
+    return accepted.firstNotNullOfOrNull { registry.compressionPool(it) }
 }
 
 /**
@@ -507,7 +502,7 @@ private suspend fun handleStreaming(
     val streamEncoding = call.request.headers[protocol.compressionHeader]
     val streamPool: CompressionPool? = when {
         streamEncoding == null || streamEncoding == IDENTITY_ENCODING -> null
-        else -> COMPRESSION_POOLS[streamEncoding] ?: run {
+        else -> registry.compressionPool(streamEncoding) ?: run {
             respondStreamError(
                 call,
                 requestContentType,
@@ -538,31 +533,32 @@ private suspend fun handleStreaming(
             val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
             val uh = (handler as UnaryHandler<Any, Any>).wrapUnary(combined)
-            handleUnaryAsStream(call, uh, ctx, codec, requestContentType, protocol, streamPool, opts)
+            handleUnaryAsStream(call, registry, uh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.SERVER -> {
             val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
             val sh = (handler as ServerStreamHandler<Any, Any>).wrapServerStream(combined)
-            handleServerStream(call, sh, ctx, codec, requestContentType, protocol, streamPool, opts)
+            handleServerStream(call, registry, sh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.CLIENT -> {
             val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
             val ch = (handler as ClientStreamHandler<Any, Any>).wrapClientStream(combined)
-            handleClientStream(call, ch, ctx, codec, requestContentType, protocol, streamPool, opts)
+            handleClientStream(call, registry, ch, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
         StreamType.BIDI -> {
             val combined = registry.interceptors + registry.interceptorsFor(procedure)
             @Suppress("UNCHECKED_CAST")
             val bh = (handler as BidiStreamHandler<Any, Any>).wrapBidi(combined)
-            handleBidiStream(call, bh, ctx, codec, requestContentType, protocol, streamPool, opts)
+            handleBidiStream(call, registry, bh, ctx, codec, requestContentType, protocol, streamPool, opts)
         }
     }
 }
 
 private suspend fun handleUnaryAsStream(
     call: ApplicationCall,
+    registry: HandlerRegistry,
     handler: UnaryHandler<Any, Any>,
     ctx: HandlerContext,
     codec: SerializationStrategy,
@@ -616,7 +612,7 @@ private suspend fun handleUnaryAsStream(
         null to ex.toUnknownConnectException()
     }
 
-    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader], registry)
     writeStreamResponseHeaders(call, ctx)
     if (outPool != null) {
         call.response.headers.append(protocol.compressionHeader, outPool.name(), safeOnly = false)
@@ -633,6 +629,7 @@ private suspend fun handleUnaryAsStream(
 
 private suspend fun handleServerStream(
     call: ApplicationCall,
+    registry: HandlerRegistry,
     handler: ServerStreamHandler<Any, Any>,
     ctx: HandlerContext,
     codec: SerializationStrategy,
@@ -684,7 +681,7 @@ private suspend fun handleServerStream(
     val outboundQueue = Channel<ByteArray>(Channel.UNLIMITED)
     val readyToCommit = CompletableDeferred<Unit>()
     val handlerErrorRef = java.util.concurrent.atomic.AtomicReference<ConnectException?>(null)
-    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader], registry)
 
     coroutineScope {
         val handlerJob = async {
@@ -750,6 +747,7 @@ private suspend fun handleServerStream(
 
 private suspend fun handleClientStream(
     call: ApplicationCall,
+    registry: HandlerRegistry,
     handler: ClientStreamHandler<Any, Any>,
     ctx: HandlerContext,
     codec: SerializationStrategy,
@@ -775,7 +773,7 @@ private suspend fun handleClientStream(
         null to ex.toUnknownConnectException()
     }
 
-    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader], registry)
     writeStreamResponseHeaders(call, ctx)
     if (outPool != null) {
         call.response.headers.append(protocol.compressionHeader, outPool.name(), safeOnly = false)
@@ -790,6 +788,7 @@ private suspend fun handleClientStream(
 
 private suspend fun handleBidiStream(
     call: ApplicationCall,
+    registry: HandlerRegistry,
     handler: BidiStreamHandler<Any, Any>,
     ctx: HandlerContext,
     codec: SerializationStrategy,
@@ -805,7 +804,7 @@ private suspend fun handleBidiStream(
     val requestChannel = call.receiveChannel()
     val msgRequestCodec = codec.codec(handler.methodSpec.requestClass)
     val msgResponseCodec = codec.codec(handler.methodSpec.responseClass)
-    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
+    val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader], registry)
 
     val outboundQueue = Channel<ByteArray>(Channel.UNLIMITED)
     val readyToCommit = CompletableDeferred<Unit>()
@@ -1235,7 +1234,7 @@ private suspend fun dispatchConnectGet(
     val compression = params["compression"]
     val pool = when {
         compression == null || compression == IDENTITY_ENCODING -> null
-        else -> COMPRESSION_POOLS[compression] ?: run {
+        else -> registry.compressionPool(compression) ?: run {
             respondConnectUnaryError(
                 call,
                 ctx = null,
