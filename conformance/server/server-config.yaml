@@ -1,0 +1,29 @@
+# Capabilities of the :server-ktor adapter. Same shape as
+# :conformance:server-springboot/server-config.yaml — both adapters now
+# claim the full feature surface and pass the harness's full matrix.
+features:
+  versions:
+    - HTTP_VERSION_1
+    - HTTP_VERSION_2
+  protocols:
+    - PROTOCOL_CONNECT
+    - PROTOCOL_GRPC_WEB
+    - PROTOCOL_GRPC
+  codecs:
+    - CODEC_PROTO
+    - CODEC_JSON
+  compressions:
+    - COMPRESSION_IDENTITY
+    - COMPRESSION_GZIP
+  streamTypes:
+    - STREAM_TYPE_UNARY
+    - STREAM_TYPE_SERVER_STREAM
+    - STREAM_TYPE_CLIENT_STREAM
+    - STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM
+    - STREAM_TYPE_FULL_DUPLEX_BIDI_STREAM
+  supportsHalfDuplexBidiOverHttp1: true
+  supportsTls: true
+  supportsTlsClientCerts: true
+  supportsH2c: true
+  supportsMessageReceiveLimit: true
+  supportsConnectGet: true

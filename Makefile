@@ -79,7 +79,7 @@ runconformance: generate $(CONNECT_CONFORMANCE)
 .PHONY: runserverconformance
 runserverconformance: generate $(CONNECT_CONFORMANCE) ## Run conformance tests against the Kotlin server.
 	./gradlew $(GRADLE_ARGS) conformance:server:installDist
-	$(CONNECT_CONFORMANCE) -v --mode server -- \
+	$(CONNECT_CONFORMANCE) -v --mode server --conf conformance/server/server-config.yaml -- \
 		conformance/server/build/install/server/bin/server
 
 .PHONY: runserverconformance-springboot
