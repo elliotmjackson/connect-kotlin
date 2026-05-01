@@ -21,7 +21,10 @@ import com.connectrpc.ConnectException
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.compression.CompressionPool
+import com.connectrpc.Headers as ConnectHeaders
+import com.connectrpc.server.BidiStream
 import com.connectrpc.server.BidiStreamHandler
+import com.connectrpc.server.ClientMessageStream
 import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
@@ -282,18 +285,17 @@ class ConnectServlet(
                 val sh = (handler as ServerStreamHandler<Any, Any>).wrapServerStream(combined)
                 handleServerStream(req, resp, sh, ctx, codec, requestContentType, protocol, streamPool)
             }
-            StreamType.CLIENT, StreamType.BIDI -> {
-                // Implemented in the next slice.
-                respondStreamError(
-                    resp,
-                    requestContentType,
-                    ctx,
-                    protocol,
-                    ConnectException(
-                        Code.UNIMPLEMENTED,
-                        "client-stream / bidi not yet implemented in :server-springboot",
-                    ),
-                )
+            StreamType.CLIENT -> {
+                val combined = registry.interceptors + registry.interceptorsFor(procedure)
+                @Suppress("UNCHECKED_CAST")
+                val ch = (handler as ClientStreamHandler<Any, Any>).wrapClientStream(combined)
+                handleClientStream(req, resp, ch, ctx, codec, requestContentType, protocol, streamPool)
+            }
+            StreamType.BIDI -> {
+                val combined = registry.interceptors + registry.interceptorsFor(procedure)
+                @Suppress("UNCHECKED_CAST")
+                val bh = (handler as BidiStreamHandler<Any, Any>).wrapBidi(combined)
+                handleBidiStream(req, resp, bh, ctx, codec, requestContentType, protocol, streamPool)
             }
         }
     }
@@ -440,6 +442,151 @@ class ConnectServlet(
             beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
         }
         finishStreamResponse(resp, ctx, protocol, handlerError)
+    }
+
+    private suspend fun handleClientStream(
+        req: HttpServletRequest,
+        resp: HttpServletResponse,
+        handler: ClientStreamHandler<Any, Any>,
+        ctx: HandlerContext,
+        codec: SerializationStrategy,
+        requestContentType: String,
+        protocol: StreamingProtocol,
+        pool: CompressionPool?,
+    ) {
+        val messages = readAllRequestEnvelopes(
+            req.inputStream.readAllBytes(),
+            handler.methodSpec.requestClass,
+            codec,
+            pool,
+        ) ?: run {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(Code.INTERNAL_ERROR, "request envelope marked compressed but no compression negotiated"),
+            )
+            return
+        }
+
+        val inStream = BufferedClientMessageStream(messages, ctx.requestHeaders)
+
+        val (response, handlerError) = try {
+            invokeWithTimeout(ctx.timeoutMs) { handler.handle(inStream, ctx) } to null
+        } catch (ex: TimeoutCancellationException) {
+            null to ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
+        } catch (ex: ConnectException) {
+            null to ex
+        } catch (ex: kotlinx.coroutines.CancellationException) {
+            throw ex
+        } catch (ex: Throwable) {
+            null to ex.toUnknownConnectException()
+        }
+
+        val outPool = pickPool(req.getHeader(protocol.acceptEncodingHeader))
+        beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+        if (response != null) {
+            val bytes = codec.codec(handler.methodSpec.responseClass).serialize(response).readByteArray()
+            resp.outputStream.write(encodeOutboundEnvelope(0, bytes, outPool, options.compressMinBytes))
+        }
+        finishStreamResponse(resp, ctx, protocol, handlerError)
+    }
+
+    /**
+     * Half-duplex bidi: drain all inbound envelopes first, then run the
+     * handler, which can interleave [com.connectrpc.server.BidiStream.receive]
+     * and [com.connectrpc.server.BidiStream.send] freely. Full-duplex over
+     * HTTP/2 needs async ReadListener/WriteListener and is a follow-up.
+     */
+    private suspend fun handleBidiStream(
+        req: HttpServletRequest,
+        resp: HttpServletResponse,
+        handler: BidiStreamHandler<Any, Any>,
+        ctx: HandlerContext,
+        codec: SerializationStrategy,
+        requestContentType: String,
+        protocol: StreamingProtocol,
+        pool: CompressionPool?,
+    ) {
+        val messages = readAllRequestEnvelopes(
+            req.inputStream.readAllBytes(),
+            handler.methodSpec.requestClass,
+            codec,
+            pool,
+        ) ?: run {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(Code.INTERNAL_ERROR, "request envelope marked compressed but no compression negotiated"),
+            )
+            return
+        }
+
+        val outPool = pickPool(req.getHeader(protocol.acceptEncodingHeader))
+        val responseCodec = codec.codec(handler.methodSpec.responseClass)
+        var started = false
+        val bidi = BufferedBidiStream<Any, Any>(
+            messages = messages,
+            headers = ctx.requestHeaders,
+            onSend = { message ->
+                if (!started) {
+                    started = true
+                    beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+                }
+                val bytes = responseCodec.serialize(message).readByteArray()
+                resp.outputStream.write(encodeOutboundEnvelope(0, bytes, outPool, options.compressMinBytes))
+                resp.outputStream.flush()
+            },
+        )
+
+        val handlerError: ConnectException? = try {
+            invokeWithTimeout(ctx.timeoutMs) { handler.handle(bidi, ctx) }
+            null
+        } catch (ex: TimeoutCancellationException) {
+            ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
+        } catch (ex: ConnectException) {
+            ex
+        } catch (ex: kotlinx.coroutines.CancellationException) {
+            throw ex
+        } catch (ex: Throwable) {
+            ex.toUnknownConnectException()
+        }
+
+        if (!started) {
+            beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+        }
+        finishStreamResponse(resp, ctx, protocol, handlerError)
+    }
+
+    /**
+     * Reads every envelope from the buffered request body, applying inbound
+     * compression and message-size enforcement. Returns the decoded list, or
+     * null if a compressed envelope arrived without negotiated compression.
+     */
+    private fun readAllRequestEnvelopes(
+        rawBytes: ByteArray,
+        requestClass: kotlin.reflect.KClass<Any>,
+        codec: SerializationStrategy,
+        pool: CompressionPool?,
+    ): List<Any>? {
+        val buffer = Buffer().write(rawBytes)
+        val msgCodec = codec.codec(requestClass)
+        val messages = mutableListOf<Any>()
+        while (true) {
+            val env = decodeNextEnvelope(buffer) ?: break
+            val decoded = decompressEnvelopeIfNeeded(env, pool) ?: return null
+            if (options.maxReceiveMessageSize > 0 && decoded.payload.size > options.maxReceiveMessageSize) {
+                throw ConnectException(
+                    Code.RESOURCE_EXHAUSTED,
+                    "message size ${decoded.payload.size} exceeds limit of ${options.maxReceiveMessageSize}",
+                )
+            }
+            messages += msgCodec.deserialize(Buffer().write(decoded.payload))
+        }
+        return messages
     }
 
     /**
@@ -785,6 +932,24 @@ private fun parseGrpcTimeoutMs(value: String): Long? {
         'n' -> (digits + 999_999L) / 1_000_000L
         else -> null
     }
+}
+
+private class BufferedClientMessageStream<Req : Any>(
+    messages: List<Req>,
+    override val headers: ConnectHeaders,
+) : ClientMessageStream<Req> {
+    private val iterator = messages.iterator()
+    override suspend fun receive(): Req? = if (iterator.hasNext()) iterator.next() else null
+}
+
+private class BufferedBidiStream<Req : Any, Res : Any>(
+    messages: List<Req>,
+    override val headers: ConnectHeaders,
+    private val onSend: suspend (Res) -> Unit,
+) : BidiStream<Req, Res> {
+    private val iterator = messages.iterator()
+    override suspend fun receive(): Req? = if (iterator.hasNext()) iterator.next() else null
+    override suspend fun send(message: Res) = onSend(message)
 }
 
 private fun <Req : Any, Res : Any> UnaryHandler<Req, Res>.wrapUnary(
