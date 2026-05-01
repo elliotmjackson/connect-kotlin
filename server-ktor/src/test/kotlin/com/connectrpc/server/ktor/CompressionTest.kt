@@ -83,6 +83,51 @@ class CompressionTest {
     }
 
     /**
+     * Same shape as [outboundGzipCompression] but with deflate. Verifies
+     * the COMPRESSION_POOLS map dispatches by name and the deflate pool
+     * round-trips correctly via the JDK's Inflater.
+     */
+    @Test
+    fun outboundDeflateCompression() {
+        val largePayload = ByteArray(64_000) { (it % 256).toByte() }
+        val handler = object : UnaryHandler<TestMessage, TestMessage> {
+            override val methodSpec = MethodSpec(
+                "test.v1.TestService/Echo",
+                TestMessage::class,
+                TestMessage::class,
+                StreamType.UNARY,
+            )
+
+            override suspend fun handle(request: TestMessage, ctx: HandlerContext): TestMessage =
+                TestMessage(largePayload)
+        }
+        val registry = HandlerRegistry.builder()
+            .codec(TestSerializationStrategy)
+            .register(handler)
+            .build()
+
+        TestServer.start(registry).use { server ->
+            val req = Request.Builder()
+                .url("${server.baseUrl}/test.v1.TestService/Echo")
+                .header("Content-Type", "application/proto")
+                .header("Accept-Encoding", "deflate")
+                .post(ByteArray(0).toRequestBody("application/proto".toMediaType()))
+                .build()
+
+            newTestClient().newCall(req).execute().use { response ->
+                assertThat(response.header("Content-Encoding")).isEqualTo("deflate")
+                val compressedBody = response.body!!.bytes()
+                assertThat(compressedBody.size).isLessThan(largePayload.size / 2)
+                // Decompress and verify roundtrip.
+                val decompressed = java.util.zip.InflaterInputStream(
+                    java.io.ByteArrayInputStream(compressedBody),
+                ).use { it.readBytes() }
+                assertThat(decompressed).isEqualTo(largePayload)
+            }
+        }
+    }
+
+    /**
      * Streaming variant: when client sends Connect-Accept-Encoding: gzip on a
      * Connect server-stream, the server should set the response's
      * Connect-Content-Encoding header to gzip and compress each emitted

@@ -23,6 +23,7 @@ import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.Idempotency
 import com.connectrpc.compression.CompressionPool
+import com.connectrpc.compression.DeflateCompressionPool
 import com.connectrpc.compression.GzipCompressionPool
 import com.connectrpc.server.BidiStream
 import com.connectrpc.server.BidiStreamHandler
@@ -94,6 +95,7 @@ private const val CONNECT_PROTOCOL_VERSION_VALUE = "1"
 /** Compression algorithms recognized server-side. Always includes identity. */
 private val COMPRESSION_POOLS: Map<String, CompressionPool> = mapOf(
     GzipCompressionPool.name() to GzipCompressionPool,
+    DeflateCompressionPool.name() to DeflateCompressionPool,
 )
 
 /**
