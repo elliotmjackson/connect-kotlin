@@ -7,13 +7,14 @@ wire protocol is selected from the request `Content-Type`.
 
 ## Status
 
-Conformance: 1367 / 1367 (Connect + gRPC + gRPC-Web, HTTP/1.1 and HTTP/2,
-all four stream types, Connect-GET, TLS with optional client certs,
-message receive limits, gzip and deflate compression).
+Conformance: 2152 / 2152 (Connect + gRPC + gRPC-Web, HTTP/1.1 and HTTP/2,
+TLS and cleartext including h2c prior-knowledge, all four stream types,
+Connect-GET, optional client certs, message receive limits, gzip and
+deflate compression).
 
-Not yet supported: HTTP/2 prior-knowledge over cleartext (`h2c`) for gRPC
-clients — Ktor's `enableH2c` only performs the HTTP/1.1 Upgrade dance,
-which gRPC clients don't use. Run over TLS or HTTP/1.1 in production.
+To run gRPC over HTTP/2 cleartext (h2c), enable both `enableHttp2 = true`
+and `enableH2c = true` on the Netty engine. Connect and gRPC-Web also
+work over HTTP/1.1 with no extra configuration.
 
 ## Quickstart
 
@@ -61,9 +62,16 @@ fun main() {
         .registerAll(ElizaServiceImpl().handlers())
         .build()
 
-    embeddedServer(Netty, port = 8080) {
-        connectRpc(registry)
-    }.start(wait = true)
+    embeddedServer(
+        factory = Netty,
+        environment = applicationEnvironment { },
+        configure = {
+            connector { host = "0.0.0.0"; port = 8080 }
+            enableHttp2 = true   // gRPC over HTTP/2 (with TLS or h2c)
+            enableH2c = true     // HTTP/2 cleartext via prior-knowledge or Upgrade
+        },
+        module = { connectRpc(registry) },
+    ).start(wait = true)
 }
 ```
 

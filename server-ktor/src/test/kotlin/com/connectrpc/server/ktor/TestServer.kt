@@ -57,7 +57,7 @@ internal class TestServer private constructor(
                         port = 0
                     }
                     enableH2c = withH2c
-                    enableHttp2 = false
+                    enableHttp2 = withH2c
                 },
                 module = {
                     connectRpc(

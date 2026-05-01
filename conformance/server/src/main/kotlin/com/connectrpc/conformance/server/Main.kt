@@ -23,6 +23,7 @@ import com.connectrpc.extensions.GoogleJavaProtobufStrategy
 import com.connectrpc.server.ktor.connectRpc
 import com.google.protobuf.ByteString
 import io.ktor.server.engine.applicationEnvironment
+import io.ktor.server.engine.connector
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.engine.sslConnector
 import io.ktor.server.netty.Netty
@@ -99,9 +100,21 @@ internal fun runBlockingMain(
             },
         )
     } else {
-        embeddedServer(Netty, port = 0, host = "127.0.0.1") {
-            connectRpc(registry, maxReceiveMessageSize = maxReceiveSize)
-        }
+        embeddedServer(
+            factory = Netty,
+            environment = applicationEnvironment { },
+            configure = {
+                connector {
+                    host = "127.0.0.1"
+                    port = 0
+                }
+                enableHttp2 = wantHttp2
+                enableH2c = wantHttp2
+            },
+            module = {
+                connectRpc(registry, maxReceiveMessageSize = maxReceiveSize)
+            },
+        )
     }
     server.start(wait = false)
 

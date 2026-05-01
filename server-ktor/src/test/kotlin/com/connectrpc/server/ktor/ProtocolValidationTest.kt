@@ -23,7 +23,6 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.assertj.core.api.Assertions.assertThat
-import org.junit.Ignore
 import org.junit.Test
 
 /**
@@ -103,17 +102,33 @@ class ProtocolValidationTest {
     }
 
     /**
-     * HTTP/2 cleartext (h2c) via the HTTP/1.1 Upgrade dance — what Ktor's
-     * `enableH2c = true` exposes. Verified end-to-end by the conformance
-     * harness with supportsH2c=true; a Kotlin-level test would need a
-     * client that performs the upgrade (OkHttp doesn't, java.net.http
-     * doesn't auto-upgrade for plaintext, and writing the raw frames by
-     * hand is too much for a unit test).
+     * HTTP/2 cleartext via prior-knowledge — gRPC clients connect this
+     * way when not using TLS. Verified that a Connect-protocol unary call
+     * succeeds over an h2c connection initiated with OkHttp's
+     * [okhttp3.Protocol.H2_PRIOR_KNOWLEDGE].
      */
     @Test
-    @Ignore("Feature exercised by conformance harness; unit test needs a non-OkHttp upgrade-aware client")
-    fun h2cUpgradeSupported() {
-        // Placeholder — conformance harness verifies h2c end-to-end.
+    fun h2cPriorKnowledgeSupported() {
+        val handler = unaryHandler { req, _ -> req }
+        val registry = HandlerRegistry.builder()
+            .codec(TestSerializationStrategy)
+            .register(handler)
+            .build()
+
+        TestServer.start(registry, withH2c = true).use { server ->
+            val req = Request.Builder()
+                .url("${server.baseUrl}/test.v1.TestService/Unary")
+                .header("Content-Type", "application/proto")
+                .post(TestMessage("hello").bytes.toRequestBody("application/proto".toMediaType()))
+                .build()
+
+            newTestClient(h2cPriorKnowledge = true).newCall(req).execute().use { response ->
+                assertThat(response.protocol).isEqualTo(okhttp3.Protocol.H2_PRIOR_KNOWLEDGE)
+                assertThat(response.isSuccessful).isTrue()
+                val body = TestMessage(response.body!!.bytes())
+                assertThat(body.text()).isEqualTo("hello")
+            }
+        }
     }
 }
 
