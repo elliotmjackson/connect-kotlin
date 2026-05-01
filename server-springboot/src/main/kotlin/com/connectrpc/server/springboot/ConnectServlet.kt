@@ -18,6 +18,7 @@ import com.connectrpc.CODEC_NAME_JSON
 import com.connectrpc.CODEC_NAME_PROTO
 import com.connectrpc.Code
 import com.connectrpc.ConnectException
+import com.connectrpc.Idempotency
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.compression.CompressionPool
@@ -165,6 +166,10 @@ class ConnectServlet(
         resp: HttpServletResponse,
         procedure: String,
     ) {
+        if (req.method == "GET") {
+            dispatchConnectGet(req, resp, procedure)
+            return
+        }
         val contentType = req.contentType?.substringBefore(';')?.trim() ?: ""
         val (codecName, protocol) = when (contentType) {
             CONNECT_UNARY_CONTENT_TYPE_PROTO -> CODEC_NAME_PROTO to null
@@ -461,12 +466,17 @@ class ConnectServlet(
         protocol: StreamingProtocol,
         pool: CompressionPool?,
     ) {
-        val messages = readAllRequestEnvelopes(
-            req.inputStream.readAllBytes(),
-            handler.methodSpec.requestClass,
-            codec,
-            pool,
-        ) ?: run {
+        val messages = try {
+            readAllRequestEnvelopes(
+                req.inputStream.readAllBytes(),
+                handler.methodSpec.requestClass,
+                codec,
+                pool,
+            )
+        } catch (ex: ConnectException) {
+            respondStreamError(resp, requestContentType, ctx, protocol, ex)
+            return
+        } ?: run {
             respondStreamError(
                 resp,
                 requestContentType,
@@ -780,12 +790,23 @@ class ConnectServlet(
         }
         val userTrailers = ctx?.responseTrailers?.mapValues { it.value.toList() } ?: emptyMap()
         if (protocol.usesHttpTrailers) {
-            // Tomcat sends an empty DATA frame instead of a true trailer-only
-            // response, which strict gRPC clients reject — promote grpc-* to
-            // regular response headers so they reach the client either way.
-            for ((name, value) in protocol.buildHttpTrailers(exception, userTrailers)) {
+            // gRPC trailers-only response. Strict gRPC clients (grpc-go) want
+            // an HTTP/2 TRAILERS frame, not the trailer-only HEADERS frame
+            // Tomcat would emit on its own. Setting both:
+            //   - trailer fields supplier (so a real TRAILERS frame is sent)
+            //   - the same fields as response headers (Tomcat's known quirk
+            //     of sometimes emitting an empty DATA frame in place of
+            //     trailers means lenient clients can still pick up the
+            //     status from headers)
+            // and writing an empty envelope body forces Tomcat to emit DATA
+            // followed by TRAILERS rather than a malformed trailer-only
+            // single-HEADERS frame.
+            val pairs = protocol.buildHttpTrailers(exception, userTrailers)
+            for ((name, value) in pairs) {
                 resp.addHeader(name, value)
             }
+            resp.setTrailerFields { joinMultiValuePairs(pairs) }
+            resp.outputStream.write(ByteArray(0))
             resp.outputStream.flush()
             return
         }
@@ -912,14 +933,165 @@ class ConnectServlet(
         return accepted.firstNotNullOfOrNull { registry.compressionPool(it) }
     }
 
-    private fun newHandlerContext(req: HttpServletRequest, procedure: String) =
+    private fun newHandlerContext(
+        req: HttpServletRequest,
+        procedure: String,
+        queryParams: Map<String, List<String>>? = null,
+    ) =
         HandlerContext(
             procedure = procedure,
             requestHeaders = headersAsMap(req),
             httpMethod = req.method,
             timeoutMs = req.getHeader(CONNECT_TIMEOUT_HEADER)?.toLongOrNull()
                 ?: req.getHeader(GRPC_TIMEOUT_HEADER)?.let(::parseGrpcTimeoutMs),
+            queryParams = queryParams,
         )
+
+    /**
+     * Connect-GET dispatch for idempotent unary procedures. Parses
+     * `?connect=v1&encoding=...&message=...&base64=1&compression=...`.
+     */
+    private suspend fun dispatchConnectGet(
+        req: HttpServletRequest,
+        resp: HttpServletResponse,
+        procedure: String,
+    ) {
+        val handler = registry.find(procedure) as? UnaryHandler<*, *>
+        if (handler == null || handler.methodSpec.idempotency != Idempotency.NO_SIDE_EFFECTS) {
+            resp.status = HttpServletResponse.SC_NOT_FOUND
+            return
+        }
+
+        if (req.getParameter("connect") != "v1") {
+            writeUnaryConnectError(
+                resp,
+                ConnectException(Code.INVALID_ARGUMENT, "missing or invalid connect query param"),
+            )
+            return
+        }
+        val encoding = req.getParameter("encoding")
+        val codecName = when (encoding) {
+            CODEC_NAME_PROTO -> CODEC_NAME_PROTO
+            CODEC_NAME_JSON -> CODEC_NAME_JSON
+            else -> {
+                writeUnaryConnectError(
+                    resp,
+                    ConnectException(Code.INVALID_ARGUMENT, "missing or invalid encoding query param"),
+                )
+                return
+            }
+        }
+        val codec = registry.codec(codecName)
+        if (codec == null) {
+            writeUnaryConnectError(
+                resp,
+                ConnectException(Code.UNIMPLEMENTED, "codec $codecName is not registered"),
+            )
+            return
+        }
+
+        val message = req.getParameter("message")
+        if (message == null) {
+            writeUnaryConnectError(
+                resp,
+                ConnectException(Code.INVALID_ARGUMENT, "missing message query param"),
+            )
+            return
+        }
+        val isBase64 = req.getParameter("base64") == "1"
+        val rawBytes = try {
+            if (isBase64) {
+                java.util.Base64.getUrlDecoder().decode(message.padBase64())
+            } else {
+                message.toByteArray(Charsets.UTF_8)
+            }
+        } catch (ex: Exception) {
+            writeUnaryConnectError(
+                resp,
+                ConnectException(Code.INVALID_ARGUMENT, "could not decode message: ${ex.message}"),
+            )
+            return
+        }
+
+        val compression = req.getParameter("compression")
+        val pool = when {
+            compression == null || compression == IDENTITY_ENCODING -> null
+            else -> registry.compressionPool(compression) ?: run {
+                writeUnaryConnectError(
+                    resp,
+                    ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $compression"),
+                )
+                return
+            }
+        }
+        val decompressed = if (pool != null) {
+            try {
+                pool.decompress(Buffer().write(rawBytes)).readByteArray()
+            } catch (ex: Exception) {
+                writeUnaryConnectError(
+                    resp,
+                    ConnectException(Code.INVALID_ARGUMENT, "could not decompress message: ${ex.message}"),
+                )
+                return
+            }
+        } else {
+            rawBytes
+        }
+        if (options.maxReceiveMessageSize > 0 && decompressed.size > options.maxReceiveMessageSize) {
+            writeUnaryConnectError(
+                resp,
+                ConnectException(
+                    Code.RESOURCE_EXHAUSTED,
+                    "message size ${decompressed.size} exceeds limit of ${options.maxReceiveMessageSize}",
+                ),
+            )
+            return
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        val unary = (handler as UnaryHandler<Any, Any>)
+            .wrapUnary(registry.interceptors + registry.interceptorsFor(procedure))
+        val request = try {
+            codec.codec(unary.methodSpec.requestClass).deserialize(Buffer().write(decompressed))
+        } catch (ex: Exception) {
+            writeUnaryConnectError(
+                resp,
+                ConnectException(Code.INVALID_ARGUMENT, "could not decode request: ${ex.message}"),
+            )
+            return
+        }
+        val ctx = newHandlerContext(req, procedure, queryParamsAsMap(req))
+
+        val response = try {
+            invokeWithTimeout(ctx.timeoutMs) { unary.handle(request, ctx) }
+        } catch (ex: TimeoutCancellationException) {
+            writeUnaryConnectError(resp, ctx, ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
+            return
+        } catch (ex: ConnectException) {
+            writeUnaryConnectError(resp, ctx, ex)
+            return
+        } catch (ex: kotlinx.coroutines.CancellationException) {
+            throw ex
+        } catch (ex: Throwable) {
+            writeUnaryConnectError(resp, ctx, ex.toUnknownConnectException())
+            return
+        }
+
+        applyUnaryHeaders(resp, ctx)
+        val responseBytes = codec.codec(unary.methodSpec.responseClass).serialize(response).readByteArray()
+        resp.contentType = "application/$codecName"
+        resp.status = HttpServletResponse.SC_OK
+        resp.outputStream.write(responseBytes)
+        resp.outputStream.flush()
+    }
+
+    private fun queryParamsAsMap(req: HttpServletRequest): Map<String, List<String>> {
+        val out = mutableMapOf<String, MutableList<String>>()
+        for ((name, values) in req.parameterMap) {
+            out[name] = values.toMutableList()
+        }
+        return out
+    }
 
     private fun headersAsMap(req: HttpServletRequest): Map<String, List<String>> {
         val out = mutableMapOf<String, MutableList<String>>()
@@ -978,6 +1150,14 @@ private fun Throwable.toUnknownConnectException(): ConnectException {
     val msg = message ?: this::class.qualifiedName ?: "unknown error"
     return ConnectException(code = Code.UNKNOWN, message = msg, exception = this)
 }
+
+/** Pads URL-safe base64 to a multiple of 4 by appending '=' chars. */
+private fun String.padBase64(): String =
+    when (length % 4) {
+        2 -> "$this=="
+        3 -> "$this="
+        else -> this
+    }
 
 private fun parseGrpcTimeoutMs(value: String): Long? {
     if (value.length < 2) return null

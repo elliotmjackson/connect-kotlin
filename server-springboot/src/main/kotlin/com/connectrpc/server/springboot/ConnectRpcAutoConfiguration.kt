@@ -15,6 +15,7 @@
 package com.connectrpc.server.springboot
 
 import com.connectrpc.server.HandlerRegistry
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.boot.autoconfigure.AutoConfiguration
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean
@@ -45,7 +46,15 @@ class ConnectRpcAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    fun connectRpcOptions(): ConnectRpcOptions = ConnectRpcOptions()
+    fun connectRpcOptions(
+        @Value("\${connectrpc.maxReceiveMessageSize:0}") maxReceiveMessageSize: Int,
+        @Value("\${connectrpc.requireConnectProtocolHeader:false}") requireConnectProtocolHeader: Boolean,
+        @Value("\${connectrpc.compressMinBytes:1024}") compressMinBytes: Int,
+    ): ConnectRpcOptions = ConnectRpcOptions(
+        maxReceiveMessageSize = maxReceiveMessageSize,
+        requireConnectProtocolHeader = requireConnectProtocolHeader,
+        compressMinBytes = compressMinBytes,
+    )
 
     @Bean
     fun connectServletRegistration(

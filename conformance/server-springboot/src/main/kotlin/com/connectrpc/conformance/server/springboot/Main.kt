@@ -105,6 +105,12 @@ fun main(args: Array<String>) {
         "spring.main.banner-mode" to "off",
         "logging.level.root" to "OFF",
         "spring.main.web-application-type" to "servlet",
+        "connectrpc.maxReceiveMessageSize" to request.messageReceiveLimit,
+        // Tomcat's default 2MB form-post and swallow caps would intercept
+        // oversized messages with HTTP 429; we want the adapter's
+        // RESOURCE_EXHAUSTED error path to win.
+        "server.tomcat.max-http-form-post-size" to -1,
+        "server.tomcat.max-swallow-size" to -1,
     )
 
     if (wantHttp2 && !request.useTls) {

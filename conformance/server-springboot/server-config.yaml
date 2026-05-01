@@ -25,5 +25,5 @@ features:
   supportsTls: true
   supportsTlsClientCerts: true
   supportsH2c: true
-  supportsMessageReceiveLimit: false
-  supportsConnectGet: false
+  supportsMessageReceiveLimit: true
+  supportsConnectGet: true
