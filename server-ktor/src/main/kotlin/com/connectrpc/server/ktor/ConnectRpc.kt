@@ -364,6 +364,11 @@ private suspend fun handleConnectUnary(
     } catch (ex: ConnectException) {
         respondConnectUnaryError(call, ctx, ex)
         return
+    } catch (ex: kotlinx.coroutines.CancellationException) {
+        throw ex
+    } catch (ex: Throwable) {
+        respondConnectUnaryError(call, ctx, ex.toUnknownConnectException())
+        return
     }
 
     writeUnaryHeadersAndTrailers(call, ctx)
@@ -554,6 +559,10 @@ private suspend fun handleUnaryAsStream(
         null to ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
     } catch (ex: ConnectException) {
         null to ex
+    } catch (ex: kotlinx.coroutines.CancellationException) {
+        throw ex
+    } catch (ex: Throwable) {
+        null to ex.toUnknownConnectException()
     }
 
     val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
@@ -640,6 +649,10 @@ private suspend fun handleServerStream(
                 handlerErrorRef.set(ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
             } catch (ex: ConnectException) {
                 handlerErrorRef.set(ex)
+            } catch (ex: kotlinx.coroutines.CancellationException) {
+                throw ex
+            } catch (ex: Throwable) {
+                handlerErrorRef.set(ex.toUnknownConnectException())
             } finally {
                 readyToCommit.complete(Unit)
                 outboundQueue.close()
@@ -705,6 +718,10 @@ private suspend fun handleClientStream(
         null to ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
     } catch (ex: ConnectException) {
         null to ex
+    } catch (ex: kotlinx.coroutines.CancellationException) {
+        throw ex
+    } catch (ex: Throwable) {
+        null to ex.toUnknownConnectException()
     }
 
     val outPool = pickPool(call.request.headers[protocol.acceptEncodingHeader])
@@ -762,6 +779,10 @@ private suspend fun handleBidiStream(
                 handlerErrorRef.set(ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded"))
             } catch (ex: ConnectException) {
                 handlerErrorRef.set(ex)
+            } catch (ex: kotlinx.coroutines.CancellationException) {
+                throw ex
+            } catch (ex: Throwable) {
+                handlerErrorRef.set(ex.toUnknownConnectException())
             } finally {
                 readyToCommit.complete(Unit)
                 outboundQueue.close()
@@ -1057,6 +1078,17 @@ private suspend inline fun <T> invokeWithTimeout(timeoutMs: Long?, crossinline b
         withTimeout(timeoutMs) { block() }
     }
 
+/**
+ * Wraps an arbitrary handler exception (NPE, RuntimeException, etc.) into
+ * a Connect-protocol-compliant ConnectException with code: unknown. Mirrors
+ * connect-go's behavior of mapping un-typed errors to UNKNOWN rather than
+ * letting them crash the connection.
+ */
+private fun Throwable.toUnknownConnectException(): ConnectException {
+    val msg = message ?: this::class.qualifiedName ?: "unknown error"
+    return ConnectException(code = Code.UNKNOWN, message = msg, exception = this)
+}
+
 private fun newHandlerContext(
     call: ApplicationCall,
     procedure: String,
@@ -1209,6 +1241,11 @@ private suspend fun dispatchConnectGet(
         return
     } catch (ex: ConnectException) {
         respondConnectUnaryError(call, ctx, ex)
+        return
+    } catch (ex: kotlinx.coroutines.CancellationException) {
+        throw ex
+    } catch (ex: Throwable) {
+        respondConnectUnaryError(call, ctx, ex.toUnknownConnectException())
         return
     }
 
