@@ -52,7 +52,7 @@ import okio.ByteString.Companion.toByteString
  * Override one method per RPC; the framework wires each into the appropriate
  * `Handler` via the inherited `handlers()` helper.
  */
-internal class ConformanceServiceImpl : ConformanceServiceHandler() {
+class ConformanceServiceImpl : ConformanceServiceHandler() {
     override suspend fun unary(request: UnaryRequest, ctx: HandlerContext): UnaryResponse {
         val def = if (request.hasResponseDefinition()) request.responseDefinition else null
         val payload = handleUnary(def, ctx, listOf(packAny(request)))

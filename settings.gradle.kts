@@ -4,6 +4,7 @@ include(":conformance:client")
 include(":conformance:client:google-java")
 include(":conformance:client:google-javalite")
 include(":conformance:server")
+include(":conformance:server-springboot")
 if (extra.has("skipAndroid") && extra.get("skipAndroid").toString().toBoolean()) {
     println("Skipping Android build (skipAndroid=true)")
 } else {

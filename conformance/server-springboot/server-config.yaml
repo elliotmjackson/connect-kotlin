@@ -1,0 +1,25 @@
+# What :conformance:server-springboot currently supports.
+# HTTP/1.1 only (TLS + h2c follow), all 3 protocols, all stream types except
+# full-duplex bidi (Servlet async I/O work pending).
+features:
+  versions:
+    - HTTP_VERSION_1
+  protocols:
+    - PROTOCOL_CONNECT
+    - PROTOCOL_GRPC_WEB
+  codecs:
+    - CODEC_PROTO
+  compressions:
+    - COMPRESSION_IDENTITY
+    - COMPRESSION_GZIP
+  streamTypes:
+    - STREAM_TYPE_UNARY
+    - STREAM_TYPE_SERVER_STREAM
+    - STREAM_TYPE_CLIENT_STREAM
+    - STREAM_TYPE_HALF_DUPLEX_BIDI_STREAM
+  supportsHalfDuplexBidiOverHttp1: true
+  supportsTls: false
+  supportsTlsClientCerts: false
+  supportsH2c: false
+  supportsMessageReceiveLimit: false
+  supportsConnectGet: false

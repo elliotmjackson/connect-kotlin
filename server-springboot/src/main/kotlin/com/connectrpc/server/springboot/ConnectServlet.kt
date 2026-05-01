@@ -135,8 +135,15 @@ class ConnectServlet(
 
     override fun service(req: HttpServletRequest, resp: HttpServletResponse) {
         val procedure = req.requestURI.removePrefix("/")
+        val method = req.method
+        // Connect/gRPC procedures are POST; idempotent ones accept GET via
+        // Connect-GET (handled later). Reject all other verbs so misbehaving
+        // clients fail loudly instead of getting a 200 echo.
+        if (method != "POST" && method != "GET") {
+            resp.status = HttpServletResponse.SC_METHOD_NOT_ALLOWED
+            return
+        }
         if (registry.find(procedure) == null) {
-            // Let the container's default 404 handling kick in for unknown routes.
             resp.status = HttpServletResponse.SC_NOT_FOUND
             return
         }

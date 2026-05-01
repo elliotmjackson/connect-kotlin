@@ -103,7 +103,8 @@ allprojects {
 subprojects {
     // Spring Boot 3 + Jakarta Servlet 6 require JVM 17 at runtime, so the
     // server-springboot module opts out of the project-wide JVM 1.8 target.
-    val isJvm17Module = project.name == "server-springboot"
+    val isJvm17Module = project.path == ":server-springboot" ||
+        project.path == ":conformance:server-springboot"
     tasks.withType<KotlinJvmCompile> {
         compilerOptions {
             jvmTarget.set(if (isJvm17Module) JvmTarget.JVM_17 else JvmTarget.JVM_1_8)
