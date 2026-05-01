@@ -21,15 +21,35 @@ import com.connectrpc.ConnectException
 import com.connectrpc.SerializationStrategy
 import com.connectrpc.StreamType
 import com.connectrpc.compression.CompressionPool
+import com.connectrpc.server.BidiStreamHandler
+import com.connectrpc.server.ClientStreamHandler
 import com.connectrpc.server.HandlerContext
 import com.connectrpc.server.HandlerRegistry
 import com.connectrpc.server.ServerInterceptor
+import com.connectrpc.server.ServerMessageStream
+import com.connectrpc.server.ServerStreamHandler
 import com.connectrpc.server.UnaryHandler
 import com.connectrpc.server.protocol.CONNECT_ERROR_CONTENT_TYPE
+import com.connectrpc.server.protocol.CONNECT_STREAM_CONTENT_TYPE_JSON
+import com.connectrpc.server.protocol.CONNECT_STREAM_CONTENT_TYPE_PROTO
 import com.connectrpc.server.protocol.CONNECT_UNARY_CONTENT_TYPE_JSON
 import com.connectrpc.server.protocol.CONNECT_UNARY_CONTENT_TYPE_PROTO
+import com.connectrpc.server.protocol.ENVELOPE_FLAG_COMPRESSED
+import com.connectrpc.server.protocol.ENVELOPE_FLAG_END_STREAM
+import com.connectrpc.server.protocol.ENVELOPE_FLAG_GRPC_WEB_TRAILER
+import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_BARE
+import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_JSON
+import com.connectrpc.server.protocol.GRPC_CONTENT_TYPE_PROTO
+import com.connectrpc.server.protocol.GRPC_WEB_CONTENT_TYPE_BARE
+import com.connectrpc.server.protocol.GRPC_WEB_CONTENT_TYPE_JSON
+import com.connectrpc.server.protocol.GRPC_WEB_CONTENT_TYPE_PROTO
 import com.connectrpc.server.protocol.connectErrorJsonBody
 import com.connectrpc.server.protocol.connectHttpStatus
+import com.connectrpc.server.protocol.decodeNextEnvelope
+import com.connectrpc.server.protocol.encodeEnvelope
+import com.connectrpc.server.protocol.endStreamJsonPayload
+import com.connectrpc.server.protocol.grpcTrailerPairs
+import com.connectrpc.server.protocol.grpcWebTrailerPayload
 import jakarta.servlet.http.HttpServlet
 import jakarta.servlet.http.HttpServletRequest
 import jakarta.servlet.http.HttpServletResponse
@@ -43,9 +63,57 @@ import okio.Buffer
 
 private const val CONNECT_TIMEOUT_HEADER = "Connect-Timeout-Ms"
 private const val GRPC_TIMEOUT_HEADER = "Grpc-Timeout"
+private const val CONNECT_CONTENT_ENCODING_HEADER = "Connect-Content-Encoding"
+private const val GRPC_ENCODING_HEADER = "Grpc-Encoding"
 private const val IDENTITY_ENCODING = "identity"
 private const val CONNECT_PROTOCOL_VERSION_HEADER = "Connect-Protocol-Version"
 private const val CONNECT_PROTOCOL_VERSION_VALUE = "1"
+
+/**
+ * Per-protocol wire wrap: how to frame/encode trailers, which header names to
+ * read for compression, whether unary should still be enveloped (gRPC and
+ * gRPC-Web do, Connect doesn't), and whether end-of-RPC trailers go into
+ * HTTP trailing headers (gRPC) or onto the body envelope (Connect / gRPC-Web).
+ */
+private data class StreamingProtocol(
+    val trailerEnvelopeFlag: Int,
+    val buildTrailerPayload: (ConnectException?, Map<String, List<String>>) -> ByteArray,
+    val buildHttpTrailers: (ConnectException?, Map<String, List<String>>) -> List<Pair<String, String>>,
+    val compressionHeader: String,
+    val acceptEncodingHeader: String,
+    val framesUnary: Boolean,
+    val usesHttpTrailers: Boolean,
+)
+
+private val CONNECT_STREAMING = StreamingProtocol(
+    trailerEnvelopeFlag = ENVELOPE_FLAG_END_STREAM,
+    buildTrailerPayload = ::endStreamJsonPayload,
+    buildHttpTrailers = { _, _ -> emptyList() },
+    compressionHeader = CONNECT_CONTENT_ENCODING_HEADER,
+    acceptEncodingHeader = "Connect-Accept-Encoding",
+    framesUnary = false,
+    usesHttpTrailers = false,
+)
+
+private val GRPC_WEB_STREAMING = StreamingProtocol(
+    trailerEnvelopeFlag = ENVELOPE_FLAG_GRPC_WEB_TRAILER,
+    buildTrailerPayload = ::grpcWebTrailerPayload,
+    buildHttpTrailers = { _, _ -> emptyList() },
+    compressionHeader = GRPC_ENCODING_HEADER,
+    acceptEncodingHeader = "Grpc-Accept-Encoding",
+    framesUnary = true,
+    usesHttpTrailers = false,
+)
+
+private val GRPC_STREAMING = StreamingProtocol(
+    trailerEnvelopeFlag = -1,
+    buildTrailerPayload = { _, _ -> ByteArray(0) },
+    buildHttpTrailers = ::grpcTrailerPairs,
+    compressionHeader = GRPC_ENCODING_HEADER,
+    acceptEncodingHeader = "Grpc-Accept-Encoding",
+    framesUnary = true,
+    usesHttpTrailers = true,
+)
 
 /**
  * Dispatches Connect / gRPC / gRPC-Web requests by [com.connectrpc.server.HandlerRegistry] lookup.
@@ -88,9 +156,15 @@ class ConnectServlet(
         procedure: String,
     ) {
         val contentType = req.contentType?.substringBefore(';')?.trim() ?: ""
-        val codecName = when (contentType) {
-            CONNECT_UNARY_CONTENT_TYPE_PROTO -> CODEC_NAME_PROTO
-            CONNECT_UNARY_CONTENT_TYPE_JSON -> CODEC_NAME_JSON
+        val (codecName, protocol) = when (contentType) {
+            CONNECT_UNARY_CONTENT_TYPE_PROTO -> CODEC_NAME_PROTO to null
+            CONNECT_UNARY_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to null
+            CONNECT_STREAM_CONTENT_TYPE_PROTO -> CODEC_NAME_PROTO to CONNECT_STREAMING
+            CONNECT_STREAM_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to CONNECT_STREAMING
+            GRPC_WEB_CONTENT_TYPE_PROTO, GRPC_WEB_CONTENT_TYPE_BARE -> CODEC_NAME_PROTO to GRPC_WEB_STREAMING
+            GRPC_WEB_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to GRPC_WEB_STREAMING
+            GRPC_CONTENT_TYPE_PROTO, GRPC_CONTENT_TYPE_BARE -> CODEC_NAME_PROTO to GRPC_STREAMING
+            GRPC_CONTENT_TYPE_JSON -> CODEC_NAME_JSON to GRPC_STREAMING
             else -> {
                 resp.status = HttpServletResponse.SC_UNSUPPORTED_MEDIA_TYPE
                 return
@@ -105,22 +179,416 @@ class ConnectServlet(
             return
         }
 
-        if (options.requireConnectProtocolHeader) {
+        val isConnectProtocol = protocol == null || protocol === CONNECT_STREAMING
+        if (isConnectProtocol && options.requireConnectProtocolHeader) {
             val v = req.getHeader(CONNECT_PROTOCOL_VERSION_HEADER)
             if (v != CONNECT_PROTOCOL_VERSION_VALUE) {
-                writeUnaryConnectError(
+                val msg = if (v == null) {
+                    "missing required header: $CONNECT_PROTOCOL_VERSION_HEADER"
+                } else {
+                    "unsupported $CONNECT_PROTOCOL_VERSION_HEADER: $v"
+                }
+                if (protocol == null) {
+                    writeUnaryConnectError(resp, ConnectException(Code.INVALID_ARGUMENT, msg))
+                } else {
+                    respondStreamError(resp, contentType, ctx = null, protocol, ConnectException(Code.INVALID_ARGUMENT, msg))
+                }
+                return
+            }
+        }
+        if (protocol === GRPC_STREAMING) {
+            // gRPC requires TE: trailers — reject early so misconfigured clients see it.
+            val te = req.getHeaders("TE")?.toList().orEmpty()
+            val hasTrailers = te.any { it.split(',').any { v -> v.trim().equals("trailers", ignoreCase = true) } }
+            if (!hasTrailers) {
+                respondStreamError(
                     resp,
-                    ConnectException(
-                        Code.INVALID_ARGUMENT,
-                        if (v == null) "missing required header: $CONNECT_PROTOCOL_VERSION_HEADER"
-                        else "unsupported $CONNECT_PROTOCOL_VERSION_HEADER: $v",
-                    ),
+                    contentType,
+                    ctx = null,
+                    protocol,
+                    ConnectException(Code.INTERNAL_ERROR, "missing required header: TE: trailers"),
                 )
                 return
             }
         }
 
-        handleConnectUnary(req, resp, procedure, codec, codecName)
+        if (protocol == null) {
+            handleConnectUnary(req, resp, procedure, codec, codecName)
+        } else {
+            handleStreaming(req, resp, procedure, codec, contentType, protocol)
+        }
+    }
+
+    private suspend fun handleStreaming(
+        req: HttpServletRequest,
+        resp: HttpServletResponse,
+        procedure: String,
+        codec: SerializationStrategy,
+        requestContentType: String,
+        protocol: StreamingProtocol,
+    ) {
+        val handler = registry.find(procedure)
+        if (handler == null) {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx = null,
+                protocol,
+                ConnectException(Code.UNIMPLEMENTED, "$procedure is not implemented"),
+            )
+            return
+        }
+        val ctx = newHandlerContext(req, procedure)
+
+        val streamEncoding = req.getHeader(protocol.compressionHeader)
+        val streamPool: CompressionPool? = when {
+            streamEncoding == null || streamEncoding == IDENTITY_ENCODING -> null
+            else -> registry.compressionPool(streamEncoding) ?: run {
+                respondStreamError(
+                    resp,
+                    requestContentType,
+                    ctx,
+                    protocol,
+                    ConnectException(Code.UNIMPLEMENTED, "unsupported compression: $streamEncoding"),
+                )
+                return
+            }
+        }
+
+        when (handler.methodSpec.streamType) {
+            StreamType.UNARY -> {
+                if (!protocol.framesUnary) {
+                    respondStreamError(
+                        resp,
+                        requestContentType,
+                        ctx,
+                        protocol,
+                        ConnectException(
+                            Code.UNIMPLEMENTED,
+                            "Connect streaming content-type cannot be used for unary procedures",
+                        ),
+                    )
+                    return
+                }
+                @Suppress("UNCHECKED_CAST")
+                val combined = registry.interceptors + registry.interceptorsFor(procedure)
+                @Suppress("UNCHECKED_CAST")
+                val uh = (handler as UnaryHandler<Any, Any>).wrapUnary(combined)
+                handleUnaryAsStream(req, resp, uh, ctx, codec, requestContentType, protocol, streamPool)
+            }
+            StreamType.SERVER -> {
+                val combined = registry.interceptors + registry.interceptorsFor(procedure)
+                @Suppress("UNCHECKED_CAST")
+                val sh = (handler as ServerStreamHandler<Any, Any>).wrapServerStream(combined)
+                handleServerStream(req, resp, sh, ctx, codec, requestContentType, protocol, streamPool)
+            }
+            StreamType.CLIENT, StreamType.BIDI -> {
+                // Implemented in the next slice.
+                respondStreamError(
+                    resp,
+                    requestContentType,
+                    ctx,
+                    protocol,
+                    ConnectException(
+                        Code.UNIMPLEMENTED,
+                        "client-stream / bidi not yet implemented in :server-springboot",
+                    ),
+                )
+            }
+        }
+    }
+
+    private suspend fun handleUnaryAsStream(
+        req: HttpServletRequest,
+        resp: HttpServletResponse,
+        handler: UnaryHandler<Any, Any>,
+        ctx: HandlerContext,
+        codec: SerializationStrategy,
+        requestContentType: String,
+        protocol: StreamingProtocol,
+        pool: CompressionPool?,
+    ) {
+        val rawBytes = req.inputStream.readAllBytes()
+        val (env, error) = readSingleStreamEnvelope(rawBytes, pool)
+        if (error != null) {
+            respondStreamError(resp, requestContentType, ctx, protocol, error)
+            return
+        }
+        env!!
+        if (options.maxReceiveMessageSize > 0 && env.payload.size > options.maxReceiveMessageSize) {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(
+                    Code.RESOURCE_EXHAUSTED,
+                    "message size ${env.payload.size} exceeds limit of ${options.maxReceiveMessageSize}",
+                ),
+            )
+            return
+        }
+        val request = try {
+            codec.codec(handler.methodSpec.requestClass).deserialize(Buffer().write(env.payload))
+        } catch (ex: Exception) {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(Code.INVALID_ARGUMENT, "could not decode request: ${ex.message}"),
+            )
+            return
+        }
+
+        val (response, handlerError) = try {
+            invokeWithTimeout(ctx.timeoutMs) { handler.handle(request, ctx) } to null
+        } catch (ex: TimeoutCancellationException) {
+            null to ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
+        } catch (ex: ConnectException) {
+            null to ex
+        } catch (ex: kotlinx.coroutines.CancellationException) {
+            throw ex
+        } catch (ex: Throwable) {
+            null to ex.toUnknownConnectException()
+        }
+
+        val outPool = pickPool(req.getHeader(protocol.acceptEncodingHeader))
+        beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+        if (response != null) {
+            val bytes = codec.codec(handler.methodSpec.responseClass).serialize(response).readByteArray()
+            resp.outputStream.write(encodeOutboundEnvelope(0, bytes, outPool, options.compressMinBytes))
+        }
+        finishStreamResponse(resp, ctx, protocol, handlerError)
+    }
+
+    private suspend fun handleServerStream(
+        req: HttpServletRequest,
+        resp: HttpServletResponse,
+        handler: ServerStreamHandler<Any, Any>,
+        ctx: HandlerContext,
+        codec: SerializationStrategy,
+        requestContentType: String,
+        protocol: StreamingProtocol,
+        pool: CompressionPool?,
+    ) {
+        val rawBytes = req.inputStream.readAllBytes()
+        val (env, error) = readSingleStreamEnvelope(rawBytes, pool)
+        if (error != null) {
+            respondStreamError(resp, requestContentType, ctx, protocol, error)
+            return
+        }
+        env!!
+        if (options.maxReceiveMessageSize > 0 && env.payload.size > options.maxReceiveMessageSize) {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(
+                    Code.RESOURCE_EXHAUSTED,
+                    "message size ${env.payload.size} exceeds limit of ${options.maxReceiveMessageSize}",
+                ),
+            )
+            return
+        }
+        val request = try {
+            codec.codec(handler.methodSpec.requestClass).deserialize(Buffer().write(env.payload))
+        } catch (ex: Exception) {
+            respondStreamError(
+                resp,
+                requestContentType,
+                ctx,
+                protocol,
+                ConnectException(Code.INVALID_ARGUMENT, "could not decode request: ${ex.message}"),
+            )
+            return
+        }
+
+        val outPool = pickPool(req.getHeader(protocol.acceptEncodingHeader))
+        val responseCodec = codec.codec(handler.methodSpec.responseClass)
+        // Headers/trailer-supplier must be set before any byte hits the wire.
+        // Set them upfront, then flip a "started" guard on first send so user
+        // code can mutate ctx.responseHeaders before then.
+        var started = false
+        val outStream = object : ServerMessageStream<Any> {
+            override suspend fun send(message: Any) {
+                if (!started) {
+                    started = true
+                    beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+                }
+                val bytes = responseCodec.serialize(message).readByteArray()
+                resp.outputStream.write(encodeOutboundEnvelope(0, bytes, outPool, options.compressMinBytes))
+                resp.outputStream.flush()
+            }
+        }
+
+        val handlerError: ConnectException? = try {
+            invokeWithTimeout(ctx.timeoutMs) { handler.handle(request, ctx, outStream) }
+            null
+        } catch (ex: TimeoutCancellationException) {
+            ConnectException(Code.DEADLINE_EXCEEDED, "deadline exceeded")
+        } catch (ex: ConnectException) {
+            ex
+        } catch (ex: kotlinx.coroutines.CancellationException) {
+            throw ex
+        } catch (ex: Throwable) {
+            ex.toUnknownConnectException()
+        }
+
+        if (!started) {
+            beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+        }
+        finishStreamResponse(resp, ctx, protocol, handlerError)
+    }
+
+    /**
+     * Set status, headers, content-type, content-encoding, and (for gRPC)
+     * trailer supplier — everything must land before the first byte hits the
+     * output stream.
+     */
+    private fun beginStreamResponse(
+        resp: HttpServletResponse,
+        ctx: HandlerContext,
+        requestContentType: String,
+        protocol: StreamingProtocol,
+        outPool: CompressionPool?,
+    ) {
+        resp.status = HttpServletResponse.SC_OK
+        resp.contentType = requestContentType
+        for ((name, values) in ctx.responseHeaders) {
+            for (v in values) resp.addHeader(name, v)
+        }
+        if (outPool != null) {
+            resp.setHeader(protocol.compressionHeader, outPool.name())
+        }
+        if (protocol.usesHttpTrailers) {
+            // gRPC over HTTP/2 — declare the trailer-fields supplier upfront,
+            // mutate the holder later. Servlet 4+ wires this into the HTTP/2
+            // trailers frame at end-of-response.
+            resp.setTrailerFields {
+                val pairs = protocol.buildHttpTrailers(
+                    /* exception */ null,
+                    ctx.responseTrailers.mapValues { it.value.toList() },
+                )
+                pairs.toMap()
+            }
+        }
+    }
+
+    /**
+     * For envelope-trailer protocols (Connect / gRPC-Web), write the trailer
+     * envelope. For HTTP-trailer protocols (gRPC), swap in a final supplier
+     * that captures the handler's outcome.
+     */
+    private fun finishStreamResponse(
+        resp: HttpServletResponse,
+        ctx: HandlerContext,
+        protocol: StreamingProtocol,
+        handlerError: ConnectException?,
+    ) {
+        val userTrailers = ctx.responseTrailers.mapValues { it.value.toList() }
+        if (protocol.usesHttpTrailers) {
+            resp.setTrailerFields {
+                protocol.buildHttpTrailers(handlerError, userTrailers).toMap()
+            }
+        } else {
+            resp.outputStream.write(
+                encodeEnvelope(
+                    protocol.trailerEnvelopeFlag,
+                    protocol.buildTrailerPayload(handlerError, userTrailers),
+                ),
+            )
+        }
+        resp.outputStream.flush()
+    }
+
+    private fun readSingleStreamEnvelope(
+        rawBytes: ByteArray,
+        pool: CompressionPool?,
+    ): Pair<com.connectrpc.server.protocol.ConnectEnvelope?, ConnectException?> {
+        val buffer = Buffer().write(rawBytes)
+        val envelope = try {
+            decodeNextEnvelope(buffer)
+                ?: return null to ConnectException(
+                    Code.UNIMPLEMENTED,
+                    "expects exactly one request envelope, got 0",
+                )
+        } catch (ex: ConnectException) {
+            return null to ex
+        }
+        if (decodeNextEnvelope(buffer) != null) {
+            return null to ConnectException(
+                Code.UNIMPLEMENTED,
+                "expects exactly one request envelope, got more",
+            )
+        }
+        val decoded = decompressEnvelopeIfNeeded(envelope, pool)
+            ?: return null to ConnectException(
+                Code.INTERNAL_ERROR,
+                "request envelope marked compressed but no compression negotiated",
+            )
+        return decoded to null
+    }
+
+    private fun decompressEnvelopeIfNeeded(
+        envelope: com.connectrpc.server.protocol.ConnectEnvelope,
+        pool: CompressionPool?,
+    ): com.connectrpc.server.protocol.ConnectEnvelope? {
+        if (!envelope.isCompressed) return envelope
+        if (pool == null) return null
+        val decompressed = pool.decompress(Buffer().write(envelope.payload)).readByteArray()
+        return com.connectrpc.server.protocol.ConnectEnvelope(
+            flags = envelope.flags and ENVELOPE_FLAG_COMPRESSED.inv(),
+            payload = decompressed,
+        )
+    }
+
+    private fun encodeOutboundEnvelope(
+        flags: Int,
+        payload: ByteArray,
+        pool: CompressionPool?,
+        compressMinBytes: Int,
+    ): ByteArray {
+        if (pool == null || payload.size < compressMinBytes) {
+            return encodeEnvelope(flags, payload)
+        }
+        val compressed = pool.compress(Buffer().write(payload)).readByteArray()
+        return encodeEnvelope(flags or ENVELOPE_FLAG_COMPRESSED, compressed)
+    }
+
+    private fun respondStreamError(
+        resp: HttpServletResponse,
+        requestContentType: String,
+        ctx: HandlerContext?,
+        protocol: StreamingProtocol,
+        exception: ConnectException,
+    ) {
+        resp.status = HttpServletResponse.SC_OK
+        resp.contentType = requestContentType
+        if (ctx != null) {
+            for ((name, values) in ctx.responseHeaders) {
+                for (v in values) resp.addHeader(name, v)
+            }
+        }
+        val userTrailers = ctx?.responseTrailers?.mapValues { it.value.toList() } ?: emptyMap()
+        if (protocol.usesHttpTrailers) {
+            // Tomcat sends an empty DATA frame instead of a true trailer-only
+            // response, which strict gRPC clients reject — promote grpc-* to
+            // regular response headers so they reach the client either way.
+            for ((name, value) in protocol.buildHttpTrailers(exception, userTrailers)) {
+                resp.addHeader(name, value)
+            }
+            resp.outputStream.flush()
+            return
+        }
+        resp.outputStream.write(
+            encodeEnvelope(
+                protocol.trailerEnvelopeFlag,
+                protocol.buildTrailerPayload(exception, userTrailers),
+            ),
+        )
+        resp.outputStream.flush()
     }
 
     private suspend fun handleConnectUnary(
@@ -229,7 +697,8 @@ class ConnectServlet(
         return compressed to pool.name()
     }
 
-    private fun pickPool(acceptEncoding: String): CompressionPool? {
+    private fun pickPool(acceptEncoding: String?): CompressionPool? {
+        if (acceptEncoding == null) return null
         val accepted = acceptEncoding.split(',')
             .map { it.substringBefore(';').trim().lowercase() }
             .filter { it.isNotEmpty() }
@@ -324,6 +793,36 @@ private fun <Req : Any, Res : Any> UnaryHandler<Req, Res>.wrapUnary(
     var current: UnaryHandler<Req, Res> = this
     for (interceptor in interceptors.asReversed()) {
         current = interceptor.wrapUnary(current)
+    }
+    return current
+}
+
+private fun <Req : Any, Res : Any> ServerStreamHandler<Req, Res>.wrapServerStream(
+    interceptors: List<ServerInterceptor>,
+): ServerStreamHandler<Req, Res> {
+    var current: ServerStreamHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapServerStream(current)
+    }
+    return current
+}
+
+private fun <Req : Any, Res : Any> ClientStreamHandler<Req, Res>.wrapClientStream(
+    interceptors: List<ServerInterceptor>,
+): ClientStreamHandler<Req, Res> {
+    var current: ClientStreamHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapClientStream(current)
+    }
+    return current
+}
+
+private fun <Req : Any, Res : Any> BidiStreamHandler<Req, Res>.wrapBidi(
+    interceptors: List<ServerInterceptor>,
+): BidiStreamHandler<Req, Res> {
+    var current: BidiStreamHandler<Req, Res> = this
+    for (interceptor in interceptors.asReversed()) {
+        current = interceptor.wrapBidi(current)
     }
     return current
 }
