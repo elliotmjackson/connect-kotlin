@@ -101,27 +101,25 @@ class TimeoutCancellationTest {
     }
 
     /**
-     * When the client closes the underlying connection mid-stream, the
-     * handler's coroutine should be cancelled. We assert this via a flag
-     * the handler sets when CancellationException fires.
+     * When the client closes the underlying connection mid-handler, the
+     * handler's coroutine should be cancelled.
      *
-     * Currently fails for a stack of reasons:
-     * 1. OkHttp's `call.cancel()` cancels the local call but doesn't
-     *    necessarily close the pooled TCP connection.
-     * 2. For HTTP/1.1 mid-handler, the server can't detect disconnect
-     *    without actively reading or writing on the socket.
-     * 3. Even when Netty does fire channelInactive, Ktor's propagation
-     *    to the application coroutine is engine-specific.
-     *
-     * A proper fix likely combines: (a) a watcher coroutine that
-     * suspends on the request channel's close cause, (b) tying the
-     * handler's Job to that watcher, and (c) a test-side mechanism
-     * that forces the socket closed (e.g., raw Socket instead of OkHttp).
+     * Verified empirically that even with a real raw-Socket close (not
+     * OkHttp's pooled cancel), Ktor Netty does not propagate
+     * `channelInactive` to the application coroutine — the handler keeps
+     * running until it tries to write a response. To make this test pass,
+     * the adapter needs a Netty channel-inactive bridge installed via
+     * `channelPipelineConfig` that maps back to the [ApplicationCall]'s
+     * Job and cancels it. The mapping isn't exposed by Ktor's public API,
+     * so this needs reflection or a custom call attributes channel.
      */
     @Test
-    @Ignore("TDD target: needs request-channel watcher + non-OkHttp test client to force socket close")
+    @Ignore("TDD target: Ktor Netty doesn't propagate channelInactive; needs custom Netty handler bridging to ApplicationCall.coroutineContext")
     fun clientDisconnectCancelsHandler() {
         val cancelled = AtomicBoolean(false)
+        val cancelledLatch = java.util.concurrent.CountDownLatch(1)
+        val handlerEnteredLatch = java.util.concurrent.CountDownLatch(1)
+
         val handler = object : UnaryHandler<TestMessage, TestMessage> {
             override val methodSpec = MethodSpec(
                 "test.v1.TestService/Unary",
@@ -131,11 +129,13 @@ class TimeoutCancellationTest {
             )
 
             override suspend fun handle(request: TestMessage, ctx: HandlerContext): TestMessage {
+                handlerEnteredLatch.countDown()
                 try {
-                    delay(5_000)
+                    delay(30_000)
                     return TestMessage("never")
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     cancelled.set(true)
+                    cancelledLatch.countDown()
                     throw e
                 }
             }
@@ -146,32 +146,33 @@ class TimeoutCancellationTest {
             .build()
 
         TestServer.start(registry).use { server ->
-            val req = Request.Builder()
-                .url("${server.baseUrl}/test.v1.TestService/Unary")
-                .header("Content-Type", "application/proto")
-                .post(ByteArray(0).toRequestBody("application/proto".toMediaType()))
-                .build()
-            val call = newTestClient(callTimeoutMs = 30_000).newCall(req)
-            // Start the call asynchronously and cancel it after a short delay.
-            val responseLatch = java.util.concurrent.CountDownLatch(1)
-            val callback = object : okhttp3.Callback {
-                override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                    responseLatch.countDown()
-                }
-                override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                    response.close()
-                    responseLatch.countDown()
-                }
-            }
-            call.enqueue(callback)
-            Thread.sleep(200) // let the request reach the handler
-            call.cancel()
+            // Open a raw socket and write a minimal HTTP/1.1 POST.
+            val socket = java.net.Socket("127.0.0.1", server.port)
+            socket.use {
+                val out = it.getOutputStream()
+                val request = (
+                    "POST /test.v1.TestService/Unary HTTP/1.1\r\n" +
+                        "Host: 127.0.0.1\r\n" +
+                        "Content-Type: application/proto\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n"
+                    ).toByteArray()
+                out.write(request)
+                out.flush()
 
-            // Give the server a moment to observe the cancellation.
-            Thread.sleep(500)
-            assertThat(cancelled.get())
-                .describedAs("handler should observe cancellation when client disconnects")
-                .isTrue()
+                // Wait for the handler to actually start before pulling the rug.
+                assertThat(
+                    handlerEnteredLatch.await(2, java.util.concurrent.TimeUnit.SECONDS),
+                ).describedAs("handler must be reached before we close the socket").isTrue()
+
+                // Closing the socket on `use` block exit (next line) sends FIN/RST.
+            }
+            // Closed; wait for the server to observe the cancellation.
+            assertThat(
+                cancelledLatch.await(2, java.util.concurrent.TimeUnit.SECONDS),
+            ).describedAs("handler must observe cancellation within 2s of client close").isTrue()
+            assertThat(cancelled.get()).isTrue()
         }
     }
 }
