@@ -501,10 +501,18 @@ class ConnectServlet(
     }
 
     /**
-     * Half-duplex bidi: drain all inbound envelopes first, then run the
-     * handler, which can interleave [com.connectrpc.server.BidiStream.receive]
-     * and [com.connectrpc.server.BidiStream.send] freely. Full-duplex over
-     * HTTP/2 needs async ReadListener/WriteListener and is a follow-up.
+     * Bidi stream — incremental, full-duplex over HTTP/2.
+     *
+     * After `req.startAsync()` we never call `setReadListener` or
+     * `setWriteListener`, so the servlet input/output streams stay in
+     * blocking mode. Reads and writes are dispatched onto `Dispatchers.IO`
+     * so the handler can interleave them — `receive()` blocks on the next
+     * inbound envelope while a concurrent `send()` writes outbound bytes.
+     * Writes are serialized on a single mutex so overlapping `send`s don't
+     * interleave bytes mid-frame.
+     *
+     * This also covers the half-duplex pattern (drain all, then send all)
+     * since `receive()` simply returns null when the client closes its half.
      */
     private suspend fun handleBidiStream(
         req: HttpServletRequest,
@@ -516,38 +524,50 @@ class ConnectServlet(
         protocol: StreamingProtocol,
         pool: CompressionPool?,
     ) {
-        val messages = readAllRequestEnvelopes(
-            req.inputStream.readAllBytes(),
-            handler.methodSpec.requestClass,
-            codec,
-            pool,
-        ) ?: run {
-            respondStreamError(
-                resp,
-                requestContentType,
-                ctx,
-                protocol,
-                ConnectException(Code.INTERNAL_ERROR, "request envelope marked compressed but no compression negotiated"),
-            )
-            return
-        }
-
+        val input = req.inputStream
+        val output = resp.outputStream
+        val msgRequestCodec = codec.codec(handler.methodSpec.requestClass)
+        val msgResponseCodec = codec.codec(handler.methodSpec.responseClass)
         val outPool = pickPool(req.getHeader(protocol.acceptEncodingHeader))
-        val responseCodec = codec.codec(handler.methodSpec.responseClass)
+        val writeMutex = kotlinx.coroutines.sync.Mutex()
         var started = false
-        val bidi = BufferedBidiStream<Any, Any>(
-            messages = messages,
-            headers = ctx.requestHeaders,
-            onSend = { message ->
-                if (!started) {
-                    started = true
-                    beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+
+        val bidi = object : BidiStream<Any, Any> {
+            override val headers = ctx.requestHeaders
+
+            override suspend fun receive(): Any? = kotlinx.coroutines.withContext(Dispatchers.IO) {
+                val env = readEnvelopeBlocking(input) ?: return@withContext null
+                val decoded = decompressEnvelopeIfNeeded(env, pool)
+                    ?: throw ConnectException(
+                        Code.INTERNAL_ERROR,
+                        "request envelope marked compressed but no compression negotiated",
+                    )
+                if (options.maxReceiveMessageSize > 0 && decoded.payload.size > options.maxReceiveMessageSize) {
+                    throw ConnectException(
+                        Code.RESOURCE_EXHAUSTED,
+                        "message size ${decoded.payload.size} exceeds limit of ${options.maxReceiveMessageSize}",
+                    )
                 }
-                val bytes = responseCodec.serialize(message).readByteArray()
-                resp.outputStream.write(encodeOutboundEnvelope(0, bytes, outPool, options.compressMinBytes))
-                resp.outputStream.flush()
-            },
-        )
+                msgRequestCodec.deserialize(Buffer().write(decoded.payload))
+            }
+
+            override suspend fun send(message: Any) {
+                writeMutex.lock()
+                try {
+                    if (!started) {
+                        started = true
+                        beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
+                    }
+                    kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        val bytes = msgResponseCodec.serialize(message).readByteArray()
+                        output.write(encodeOutboundEnvelope(0, bytes, outPool, options.compressMinBytes))
+                        output.flush()
+                    }
+                } finally {
+                    writeMutex.unlock()
+                }
+            }
+        }
 
         val handlerError: ConnectException? = try {
             invokeWithTimeout(ctx.timeoutMs) { handler.handle(bidi, ctx) }
@@ -566,6 +586,39 @@ class ConnectServlet(
             beginStreamResponse(resp, ctx, requestContentType, protocol, outPool)
         }
         finishStreamResponse(resp, ctx, protocol, handlerError)
+    }
+
+    /**
+     * Reads exactly one Connect/gRPC envelope from a blocking stream:
+     * 1 flag byte + 4 BE length bytes + payload. Returns null on clean EOF
+     * before any byte was consumed.
+     */
+    private fun readEnvelopeBlocking(
+        input: java.io.InputStream,
+    ): com.connectrpc.server.protocol.ConnectEnvelope? {
+        val header = ByteArray(5)
+        var off = 0
+        while (off < 5) {
+            val n = input.read(header, off, 5 - off)
+            if (n < 0) {
+                if (off == 0) return null
+                throw ConnectException(Code.INVALID_ARGUMENT, "truncated envelope header: $off of 5 bytes")
+            }
+            off += n
+        }
+        val flags = header[0].toInt() and 0xff
+        val len = ((header[1].toInt() and 0xff) shl 24) or
+            ((header[2].toInt() and 0xff) shl 16) or
+            ((header[3].toInt() and 0xff) shl 8) or
+            (header[4].toInt() and 0xff)
+        val payload = ByteArray(len)
+        var pOff = 0
+        while (pOff < len) {
+            val n = input.read(payload, pOff, len - pOff)
+            if (n < 0) throw ConnectException(Code.INVALID_ARGUMENT, "truncated envelope payload: $pOff of $len bytes")
+            pOff += n
+        }
+        return com.connectrpc.server.protocol.ConnectEnvelope(flags, payload)
     }
 
     /**
