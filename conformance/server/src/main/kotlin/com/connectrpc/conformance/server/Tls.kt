@@ -25,14 +25,14 @@ import java.security.cert.X509Certificate
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Base64
 
-internal const val TLS_KEY_ALIAS = "server"
-internal val TLS_KEY_PASSWORD: CharArray = "changeit".toCharArray()
+const val TLS_KEY_ALIAS = "server"
+val TLS_KEY_PASSWORD: CharArray = "changeit".toCharArray()
 
 /**
  * Builds a trust store containing the given client CA cert(s) so that the
  * server can validate client certificates during the TLS handshake.
  */
-internal fun buildClientTrustStore(clientCertPem: ByteArray): KeyStore {
+fun buildClientTrustStore(clientCertPem: ByteArray): KeyStore {
     val cert = parseX509Certificate(clientCertPem)
     return KeyStore.getInstance("PKCS12").apply {
         load(null, null)
@@ -51,7 +51,7 @@ private fun parseX509Certificate(pem: ByteArray): X509Certificate =
  * Accepts both PKCS#8 ("PRIVATE KEY") and PKCS#1 ("RSA PRIVATE KEY") encodings;
  * the conformance harness emits the latter for RSA keys (Go's default).
  */
-internal fun buildServerKeyStore(certPem: ByteArray, keyPem: ByteArray): KeyStore {
+fun buildServerKeyStore(certPem: ByteArray, keyPem: ByteArray): KeyStore {
     val cert = parseX509Certificate(certPem)
     val key = parsePrivateKey(keyPem)
     return KeyStore.getInstance("PKCS12").apply {

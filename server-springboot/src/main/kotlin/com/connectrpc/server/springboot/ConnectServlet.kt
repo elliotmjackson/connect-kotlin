@@ -625,7 +625,7 @@ class ConnectServlet(
                     /* exception */ null,
                     ctx.responseTrailers.mapValues { it.value.toList() },
                 )
-                pairs.toMap()
+                joinMultiValuePairs(pairs)
             }
         }
     }
@@ -644,7 +644,7 @@ class ConnectServlet(
         val userTrailers = ctx.responseTrailers.mapValues { it.value.toList() }
         if (protocol.usesHttpTrailers) {
             resp.setTrailerFields {
-                protocol.buildHttpTrailers(handlerError, userTrailers).toMap()
+                joinMultiValuePairs(protocol.buildHttpTrailers(handlerError, userTrailers))
             }
         } else {
             resp.outputStream.write(
@@ -939,6 +939,18 @@ private fun parseGrpcTimeoutMs(value: String): Long? {
         'n' -> (digits + 999_999L) / 1_000_000L
         else -> null
     }
+}
+
+/**
+ * Servlet's [jakarta.servlet.http.HttpServletResponse.setTrailerFields] takes
+ * a `Supplier<Map<String, String>>` — single value per name. gRPC metadata can
+ * carry multi-value entries; HTTP semantics permit comma-joined values for
+ * repeated headers, and the gRPC-java reference client splits them back out.
+ */
+private fun joinMultiValuePairs(pairs: List<Pair<String, String>>): Map<String, String> {
+    val grouped = LinkedHashMap<String, MutableList<String>>()
+    for ((k, v) in pairs) grouped.getOrPut(k) { mutableListOf() }.add(v)
+    return grouped.mapValues { it.value.joinToString(",") }
 }
 
 private class BufferedClientMessageStream<Req : Any>(

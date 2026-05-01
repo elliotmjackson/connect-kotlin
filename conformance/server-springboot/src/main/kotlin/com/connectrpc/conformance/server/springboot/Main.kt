@@ -15,20 +15,31 @@
 package com.connectrpc.conformance.server.springboot
 
 import com.connectrpc.conformance.server.ConformanceServiceImpl
+import com.connectrpc.conformance.server.TLS_KEY_ALIAS
+import com.connectrpc.conformance.server.TLS_KEY_PASSWORD
+import com.connectrpc.conformance.server.buildClientTrustStore
 import com.connectrpc.conformance.server.buildConformanceTypeRegistry
+import com.connectrpc.conformance.server.buildServerKeyStore
 import com.connectrpc.conformance.v1.HTTPVersion
 import com.connectrpc.conformance.v1.ServerCompatRequest
 import com.connectrpc.conformance.v1.ServerCompatResponse
 import com.connectrpc.extensions.GoogleJavaJSONStrategy
 import com.connectrpc.extensions.GoogleJavaProtobufStrategy
 import com.connectrpc.server.HandlerRegistry
+import com.google.protobuf.ByteString
+import org.apache.coyote.http2.Http2Protocol
 import org.springframework.boot.SpringApplication
 import org.springframework.boot.autoconfigure.SpringBootApplication
 import org.springframework.boot.web.context.WebServerApplicationContext
+import org.springframework.boot.web.embedded.tomcat.TomcatServletWebServerFactory
+import org.springframework.boot.web.server.WebServerFactoryCustomizer
 import org.springframework.context.annotation.Bean
 import java.io.EOFException
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.nio.file.Files
+import java.security.KeyStore
 import kotlin.system.exitProcess
 
 @SpringBootApplication
@@ -40,6 +51,26 @@ open class ConformanceServerApp {
             .codec(GoogleJavaJSONStrategy(buildConformanceTypeRegistry()))
             .registerAll(ConformanceServiceImpl().handlers())
             .build()
+
+    /**
+     * Tomcat's HTTP/2 anti-DoS rejects the conformance suite's tight loops
+     * with ENHANCE_YOUR_CALM. The conformance traffic is legitimate; relax
+     * the overhead thresholds so the suite can run.
+     */
+    @Bean
+    open fun http2OverheadRelaxer(): WebServerFactoryCustomizer<TomcatServletWebServerFactory> =
+        WebServerFactoryCustomizer { factory ->
+            factory.addConnectorCustomizers({ connector ->
+                for (upgrade in connector.findUpgradeProtocols()) {
+                    if (upgrade is Http2Protocol) {
+                        upgrade.overheadCountFactor = 0
+                        upgrade.overheadDataThreshold = 0
+                        upgrade.overheadWindowUpdateThreshold = 0
+                        upgrade.overheadContinuationThreshold = 0
+                    }
+                }
+            })
+        }
 }
 
 fun main(args: Array<String>) {
@@ -52,17 +83,6 @@ fun main(args: Array<String>) {
             exitProcess(1)
         }
     }
-    if (request.useTls) {
-        System.err.println("TLS not yet supported in :conformance:server-springboot")
-        exitProcess(1)
-    }
-    if (wantHttp2) {
-        // HTTP/2 cleartext on Tomcat needs an UpgradeProtocol on the connector;
-        // this binary currently runs HTTP/1.1 only. Conformance will skip h2c
-        // configurations until that lands.
-        System.err.println("HTTP/2 cleartext not yet supported in :conformance:server-springboot")
-        exitProcess(1)
-    }
 
     val props = mutableMapOf<String, Any>(
         "server.port" to 0,
@@ -70,8 +90,46 @@ fun main(args: Array<String>) {
         "spring.main.banner-mode" to "off",
         "logging.level.root" to "OFF",
         "spring.main.web-application-type" to "servlet",
-        "connectrpc.maxReceiveMessageSize" to request.messageReceiveLimit.toLong(),
     )
+
+    if (wantHttp2 && !request.useTls) {
+        // h2c (HTTP/2 cleartext) needs a Tomcat upgrade-protocol customizer;
+        // not yet wired in this binary. TLS HTTP/2 is supported below.
+        System.err.println("HTTP/2 cleartext (h2c) not yet supported in :conformance:server-springboot")
+        exitProcess(1)
+    }
+
+    var tlsCertPem: ByteArray? = null
+    if (request.useTls) {
+        val creds = request.serverCreds
+        if (creds.cert.isEmpty || creds.key.isEmpty) {
+            System.err.println("use_tls=true but server_creds is missing cert/key")
+            exitProcess(1)
+        }
+        tlsCertPem = creds.cert.toByteArray()
+
+        val keyStore = buildServerKeyStore(creds.cert.toByteArray(), creds.key.toByteArray())
+        val keyStoreFile = writeKeyStoreToTempFile(keyStore, "server-")
+
+        props["server.ssl.enabled"] = true
+        props["server.ssl.key-store"] = "file:$keyStoreFile"
+        props["server.ssl.key-store-type"] = "PKCS12"
+        props["server.ssl.key-store-password"] = String(TLS_KEY_PASSWORD)
+        props["server.ssl.key-alias"] = TLS_KEY_ALIAS
+        props["server.ssl.key-password"] = String(TLS_KEY_PASSWORD)
+        if (wantHttp2) {
+            props["server.http2.enabled"] = true
+        }
+
+        if (!request.clientTlsCert.isEmpty) {
+            val trustStore = buildClientTrustStore(request.clientTlsCert.toByteArray())
+            val trustStoreFile = writeKeyStoreToTempFile(trustStore, "client-trust-")
+            props["server.ssl.trust-store"] = "file:$trustStoreFile"
+            props["server.ssl.trust-store-type"] = "PKCS12"
+            props["server.ssl.trust-store-password"] = String(TLS_KEY_PASSWORD)
+            props["server.ssl.client-auth"] = "need"
+        }
+    }
 
     val app = SpringApplication(ConformanceServerApp::class.java)
     app.setDefaultProperties(props.mapValues { it.value as Any })
@@ -79,14 +137,23 @@ fun main(args: Array<String>) {
     val webCtx = ctx as WebServerApplicationContext
     val port = webCtx.webServer.port
 
-    val response = ServerCompatResponse.newBuilder()
+    val responseBuilder = ServerCompatResponse.newBuilder()
         .setHost("127.0.0.1")
         .setPort(port)
-        .build()
-    writeServerCompatResponse(System.out, response)
+    if (tlsCertPem != null) {
+        responseBuilder.pemCert = ByteString.copyFrom(tlsCertPem)
+    }
+    writeServerCompatResponse(System.out, responseBuilder.build())
 
     Runtime.getRuntime().addShutdownHook(Thread { ctx.close() })
     Thread.currentThread().join()
+}
+
+private fun writeKeyStoreToTempFile(keyStore: KeyStore, prefix: String): String {
+    val tmp = Files.createTempFile(prefix, ".p12").toFile()
+    tmp.deleteOnExit()
+    FileOutputStream(tmp).use { keyStore.store(it, TLS_KEY_PASSWORD) }
+    return tmp.absolutePath
 }
 
 private fun readServerCompatRequest(input: InputStream): ServerCompatRequest {
