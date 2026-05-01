@@ -62,6 +62,7 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.content.OutgoingContent
 import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
+import io.ktor.server.netty.NettyApplicationCall
 import io.ktor.server.request.contentType
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.receiveChannel
@@ -77,10 +78,12 @@ import io.ktor.utils.io.readByteArray
 import io.ktor.utils.io.toByteArray
 import io.ktor.utils.io.writeFully
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.withTimeout
 import okio.Buffer
 
@@ -133,16 +136,64 @@ fun Application.connectRpc(
     routing {
         for (procedure in registry.procedures) {
             post("/$procedure") {
-                dispatch(call, registry, procedure, opts)
+                withCancellationOnDisconnect(call) {
+                    dispatch(call, registry, procedure, opts)
+                }
             }
             val handler = registry.find(procedure)
             if (handler != null && handler.methodSpec.idempotency == Idempotency.NO_SIDE_EFFECTS) {
                 get("/$procedure") {
-                    dispatchConnectGet(call, registry, procedure, opts)
+                    withCancellationOnDisconnect(call) {
+                        dispatchConnectGet(call, registry, procedure, opts)
+                    }
                 }
             }
         }
     }
+}
+
+/**
+ * Wires Netty-level connection close to coroutine cancellation. When the
+ * underlying channel's close future fires, this routine's Job is cancelled,
+ * propagating CancellationException to any in-flight handler suspension.
+ *
+ * No-op for non-Netty engines (the Ktor call won't be a [NettyApplicationCall]).
+ */
+private suspend inline fun withCancellationOnDisconnect(
+    call: ApplicationCall,
+    block: () -> Unit,
+) {
+    val channel = call.nettyChannelOrNull()
+    if (channel == null) {
+        block()
+        return
+    }
+    val job = currentCoroutineContext()[Job]!!
+    val listener = io.netty.util.concurrent.GenericFutureListener<io.netty.channel.ChannelFuture> {
+        job.cancel(kotlinx.coroutines.CancellationException("client disconnected"))
+    }
+    channel.closeFuture().addListener(listener)
+    try {
+        block()
+    } finally {
+        channel.closeFuture().removeListener(listener)
+    }
+}
+
+/**
+ * Unwraps the Ktor routing call layers to find the engine's
+ * [NettyApplicationCall] and return its underlying Netty channel.
+ * Returns null when the engine isn't Netty (or when Ktor's wrapping
+ * layout has changed beneath us).
+ */
+private fun ApplicationCall.nettyChannelOrNull(): io.netty.channel.Channel? {
+    val direct = (this as? NettyApplicationCall)?.context?.channel()
+    if (direct != null) return direct
+    // Within a routing block the call is a RoutingCall wrapping a
+    // RoutingPipelineCall wrapping the engine call. Reach through both.
+    val routing = (this as? io.ktor.server.routing.RoutingCall) ?: return null
+    val engineCall = routing.pipelineCall.engineCall
+    return (engineCall as? NettyApplicationCall)?.context?.channel()
 }
 
 private data class ConnectRpcOptions(

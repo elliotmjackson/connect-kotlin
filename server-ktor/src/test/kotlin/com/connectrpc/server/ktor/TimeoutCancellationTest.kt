@@ -114,7 +114,6 @@ class TimeoutCancellationTest {
      * so this needs reflection or a custom call attributes channel.
      */
     @Test
-    @Ignore("TDD target: Ktor Netty doesn't propagate channelInactive; needs custom Netty handler bridging to ApplicationCall.coroutineContext")
     fun clientDisconnectCancelsHandler() {
         val cancelled = AtomicBoolean(false)
         val cancelledLatch = java.util.concurrent.CountDownLatch(1)
