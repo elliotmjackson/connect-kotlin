@@ -11,6 +11,7 @@ kotlin {
     compilerOptions.allWarningsAsErrors.set(true)
 }
 
+
 dependencies {
     api(project(":server"))
     api(libs.ktor.server.core)
