@@ -7,10 +7,11 @@ wire protocol is selected from the request `Content-Type`.
 
 ## Status
 
-Conformance: 2152 / 2152 (Connect + gRPC + gRPC-Web, HTTP/1.1 and HTTP/2,
-TLS and cleartext including h2c prior-knowledge, all four stream types,
-Connect-GET, optional client certs, message receive limits, gzip and
-deflate compression).
+Conformance: **3618 / 3618** against the connectconformance harness's full
+default test matrix — Connect + gRPC + gRPC-Web, HTTP/1.1 and HTTP/2, TLS
+and cleartext including h2c prior-knowledge, both proto and JSON codecs,
+all four stream types, Connect-GET, optional client certs, message
+receive limits, gzip and deflate compression.
 
 To run gRPC over HTTP/2 cleartext (h2c), enable both `enableHttp2 = true`
 and `enableH2c = true` on the Netty engine. Connect and gRPC-Web also

@@ -60,7 +60,10 @@ internal class GoogleJavaJSONAdapter<E : Message>(
     }
 
     private fun serialize(message: E, deterministic: Boolean): Buffer {
-        var printer = JsonFormat.printer()
+        // Same TypeRegistry as the parser — required for resolving Any
+        // type URLs when serializing messages that embed packed types
+        // (e.g. error details).
+        var printer = JsonFormat.printer().usingTypeRegistry(registry)
         if (deterministic) {
             printer = printer.sortingMapKeys()
         }

@@ -143,8 +143,24 @@ internal fun runBlockingMain(
 private fun buildConformanceRegistry(): HandlerRegistry =
     HandlerRegistry.builder()
         .codec(GoogleJavaProtobufStrategy())
-        .codec(GoogleJavaJSONStrategy())
+        .codec(GoogleJavaJSONStrategy(buildConformanceTypeRegistry()))
         .registerAll(ConformanceServiceImpl().handlers())
+        .build()
+
+/**
+ * The conformance handlers pack the original request into [Any] for error
+ * details. Protobuf JSON requires a [com.google.protobuf.TypeRegistry] that
+ * can resolve those type URLs back to descriptors — feed it everything
+ * declared in the conformance v1 protos. Public so the springboot
+ * conformance binary can reuse it.
+ */
+fun buildConformanceTypeRegistry(): com.google.protobuf.TypeRegistry =
+    com.google.protobuf.TypeRegistry.newBuilder()
+        .add(com.connectrpc.conformance.v1.ServiceProto.getDescriptor().messageTypes)
+        .add(com.connectrpc.conformance.v1.ConfigProto.getDescriptor().messageTypes)
+        .add(com.connectrpc.conformance.v1.ServerCompatProto.getDescriptor().messageTypes)
+        .add(com.connectrpc.conformance.v1.ClientCompatProto.getDescriptor().messageTypes)
+        .add(com.connectrpc.conformance.v1.SuiteProto.getDescriptor().messageTypes)
         .build()
 
 private fun readServerCompatRequest(input: InputStream): ServerCompatRequest {

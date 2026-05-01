@@ -15,6 +15,7 @@
 package com.connectrpc.conformance.server.springboot
 
 import com.connectrpc.conformance.server.ConformanceServiceImpl
+import com.connectrpc.conformance.server.buildConformanceTypeRegistry
 import com.connectrpc.conformance.v1.HTTPVersion
 import com.connectrpc.conformance.v1.ServerCompatRequest
 import com.connectrpc.conformance.v1.ServerCompatResponse
@@ -36,7 +37,7 @@ open class ConformanceServerApp {
     open fun connectRpcRegistry(): HandlerRegistry =
         HandlerRegistry.builder()
             .codec(GoogleJavaProtobufStrategy())
-            .codec(GoogleJavaJSONStrategy())
+            .codec(GoogleJavaJSONStrategy(buildConformanceTypeRegistry()))
             .registerAll(ConformanceServiceImpl().handlers())
             .build()
 }
