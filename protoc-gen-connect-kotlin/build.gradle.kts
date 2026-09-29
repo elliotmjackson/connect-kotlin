@@ -34,6 +34,8 @@ dependencies {
     implementation(libs.protobuf.java)
     implementation(libs.kotlinpoet)
 
+    testImplementation(project(":extensions:google-java"))
+    testImplementation(project(":server"))
     testImplementation(libs.junit)
     testImplementation(libs.assertj)
     testImplementation(libs.mockito)

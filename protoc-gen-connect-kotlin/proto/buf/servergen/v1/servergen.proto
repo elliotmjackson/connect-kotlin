@@ -1,0 +1,66 @@
+// Copyright 2022-2026 The Connect Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package buf.servergen.v1;
+
+import "buf/servergen/in/v1/types.proto";
+
+option java_multiple_files = false;
+option java_outer_classname = "ServerGenProto";
+option java_package = "com.connectrpc.servergen.fun.v1";
+
+message Outer {
+  message Inner {
+    string value = 1;
+  }
+}
+
+// Service whose RPC names lower-camel-case into Kotlin keywords and into the
+// name of the server handler's own dispatch method.
+service KeywordService {
+  // Unary RPC named after a Kotlin keyword.
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Object(buf.servergen.in.v1.Payload) returns (Outer.Inner);
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Fun(Outer.Inner) returns (buf.servergen.in.v1.Payload.Nested) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc In(Outer.Inner) returns (stream Outer.Inner);
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Is(stream Outer.Inner) returns (Outer.Inner) {
+    option idempotency_level = IDEMPOTENT;
+  }
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc When(stream Outer.Inner) returns (stream Outer.Inner);
+  // Shares its name with the handler dispatch method.
+  // buf:lint:ignore RPC_REQUEST_STANDARD_NAME
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  // buf:lint:ignore RPC_REQUEST_RESPONSE_UNIQUE
+  rpc Handle(Outer.Inner) returns (Outer.Inner) {
+    option deprecated = true;
+  }
+}
