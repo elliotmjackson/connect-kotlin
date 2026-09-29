@@ -556,26 +556,83 @@ class GRPCWebInterceptorTest {
     }
 
     @Test
-    fun endStreamOnTrailers() {
+    fun trailersOnlyStreamResponseSurfacesHeaderStatusAsTrailers() {
         val config = ProtocolClientConfig(
             host = "https://connectrpc.com",
             serializationStrategy = serializationStrategy,
         )
-        val grpcWebInterceptor = GRPCWebInterceptor(config)
-        val streamFunction = grpcWebInterceptor.streamFunction()
+        val streamFunction = GRPCWebInterceptor(config).streamFunction()
+        streamFunction.streamResultFunction(
+            StreamResult.Headers(
+                headers = mapOf(
+                    CONTENT_TYPE to listOf("application/grpc-web+encoding_type"),
+                    GRPC_STATUS_TRAILER to listOf("${Code.FAILED_PRECONDITION.value}"),
+                    GRPC_MESSAGE_TRAILER to listOf("error"),
+                    "x-custom-trailer" to listOf("bing", "quuz"),
+                ),
+            ),
+        )
 
-        val result = streamFunction.streamResultFunction(
-            StreamResult.Complete(
-                trailers = mapOf(
+        val result = streamFunction.streamResultFunction(StreamResult.Complete())
+
+        assertThat(result).isOfAnyClassIn(StreamResult.Complete::class.java)
+        val completion = result as StreamResult.Complete
+        assertThat(completion.cause!!.code).isEqualTo(Code.FAILED_PRECONDITION)
+        assertThat(completion.cause!!.message).isEqualTo("error")
+        assertThat(completion.cause!!.metadata["x-custom-trailer"]).containsExactly("bing", "quuz")
+        assertThat(completion.trailers["x-custom-trailer"]).containsExactly("bing", "quuz")
+    }
+
+    @Test
+    fun trailersOnlyStreamResponseWithOkStatus() {
+        val config = ProtocolClientConfig(
+            host = "https://connectrpc.com",
+            serializationStrategy = serializationStrategy,
+        )
+        val streamFunction = GRPCWebInterceptor(config).streamFunction()
+        streamFunction.streamResultFunction(
+            StreamResult.Headers(
+                headers = mapOf(
+                    CONTENT_TYPE to listOf("application/grpc-web+encoding_type"),
+                    GRPC_STATUS_TRAILER to listOf("0"),
                     "key" to listOf("value"),
                 ),
             ),
         )
 
+        val result = streamFunction.streamResultFunction(StreamResult.Complete())
+
         assertThat(result).isOfAnyClassIn(StreamResult.Complete::class.java)
         val completion = result as StreamResult.Complete
         assertThat(completion.cause).isNull()
         assertThat(completion.trailers["key"]).containsExactly("value")
+    }
+
+    @Test
+    fun streamEndingWithoutTrailersAfterMessageIsAnError() {
+        val config = ProtocolClientConfig(
+            host = "https://connectrpc.com",
+            serializationStrategy = serializationStrategy,
+        )
+        val streamFunction = GRPCWebInterceptor(config).streamFunction()
+        streamFunction.streamResultFunction(
+            StreamResult.Headers(
+                headers = mapOf(
+                    CONTENT_TYPE to listOf("application/grpc-web+encoding_type"),
+                    // Ignored once the body carries a message.
+                    GRPC_STATUS_TRAILER to listOf("0"),
+                ),
+            ),
+        )
+        streamFunction.streamResultFunction(
+            StreamResult.Message(Envelope.pack(Buffer().write("hello".encodeUtf8()))),
+        )
+
+        val result = streamFunction.streamResultFunction(StreamResult.Complete())
+
+        assertThat(result).isOfAnyClassIn(StreamResult.Complete::class.java)
+        val completion = result as StreamResult.Complete
+        assertThat(completion.cause!!.code).isEqualTo(Code.UNKNOWN)
     }
 
     @Test

@@ -107,7 +107,11 @@ private class ResponseCallback(
             val httpStatus = resp.originalCode()
             runBlocking {
                 val headers = resp.headers.toLowerCaseKeysMultiMap()
-                onResult(StreamResult.Headers(headers = headers))
+                // A non-200 status takes precedence over the headers, whose
+                // content-type the protocol interceptors would reject first.
+                // Clients infer the code from the status (protocol.md "HTTP to
+                // Error Code"; http-grpc-status-mapping.md), and the headers
+                // become the error's metadata.
                 if (httpStatus != 200) {
                     val finalResult = StreamResult.Complete<Buffer>(
                         trailers = resp.safeTrailers(),
@@ -120,6 +124,7 @@ private class ResponseCallback(
                     onResult(finalResult)
                     return@runBlocking
                 }
+                onResult(StreamResult.Headers(headers = headers))
                 resp.body.source().use { sourceBuffer ->
                     var connEx: ConnectException? = null
                     try {
