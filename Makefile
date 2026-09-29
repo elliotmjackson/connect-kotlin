@@ -84,6 +84,12 @@ runserverconformance: generate $(CONNECT_CONFORMANCE) ## Run conformance tests a
 	$(CONNECT_CONFORMANCE) -v --mode server --conf conformance/server/server-config.yaml -- \
 		conformance/server/build/install/server/bin/server
 
+.PHONY: runserverconformance-springboot
+runserverconformance-springboot: generate $(CONNECT_CONFORMANCE) ## Run conformance tests against the Spring Boot Kotlin server.
+	./gradlew $(GRADLE_ARGS) conformance:server-springboot:installDist
+	$(CONNECT_CONFORMANCE) -v --mode server --conf conformance/server-springboot/server-config.yaml -- \
+		conformance/server-springboot/build/install/server-springboot/bin/server-springboot
+
 ifeq ($(UNAME_OS),Darwin)
 PROTOC_OS := osx
 ifeq ($(UNAME_ARCH),arm64)
@@ -185,4 +191,4 @@ releaselocal: ## Release artifacts to local maven repository.
 
 .PHONY: test
 test: generate ## Run tests for the library, its extensions, the code generator and the server modules.
-	./gradlew $(GRADLE_ARGS) library:test okhttp:test extensions:google-java:test extensions:google-javalite:test protoc-gen-connect-kotlin:test server:test server-ktor:test
+	./gradlew $(GRADLE_ARGS) library:test okhttp:test extensions:google-java:test extensions:google-javalite:test protoc-gen-connect-kotlin:test server:test server-ktor:test server-springboot:test

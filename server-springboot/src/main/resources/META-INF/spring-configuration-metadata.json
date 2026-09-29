@@ -1,0 +1,92 @@
+{
+  "groups": [
+    {
+      "name": "connectrpc",
+      "type": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties"
+    },
+    {
+      "name": "connectrpc.tomcat",
+      "type": "com.connectrpc.server.springboot.ConnectRpcProperties$Tomcat",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "sourceMethod": "getTomcat()"
+    }
+  ],
+  "properties": [
+    {
+      "name": "connectrpc.enabled",
+      "type": "java.lang.Boolean",
+      "description": "Whether to register the Connect servlet for the application's HandlerRegistry.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": true
+    },
+    {
+      "name": "connectrpc.read-max-bytes",
+      "type": "java.lang.Long",
+      "description": "Largest accepted request message, in bytes, both on the wire and after decompression. Zero means unlimited.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": 4194304
+    },
+    {
+      "name": "connectrpc.send-max-bytes",
+      "type": "java.lang.Long",
+      "description": "Largest response message a handler may send, in bytes, before compression. Zero means unlimited.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": 0
+    },
+    {
+      "name": "connectrpc.require-connect-protocol-header",
+      "type": "java.lang.Boolean",
+      "description": "Whether to reject Connect unary requests without Connect-Protocol-Version: 1 (GET: without the connect=v1 query parameter).",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": false
+    },
+    {
+      "name": "connectrpc.compress-min-bytes",
+      "type": "java.lang.Long",
+      "description": "Smallest response message, in bytes, eligible for outbound compression.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": 1024
+    },
+    {
+      "name": "connectrpc.max-timeout",
+      "type": "java.time.Duration",
+      "description": "Longest a call may read its request and run its handler: a longer or missing client timeout is replaced by this one. It does not bound writing the response: Tomcat bounds HTTP/1.1 socket writes by server.tomcat.connection-timeout (60 s by default) and HTTP/2 socket writes by 5 s, but not an HTTP/2 stream whose client keeps its connection open and grants no flow-control window. Unset sets no limit: a client that sends no deadline and stalls its request body holds its call, and its request buffers, until it disconnects, as the servlet's async timeout is disabled. Set it on servers that untrusted clients can reach, e.g. 30s for unary services.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties"
+    },
+    {
+      "name": "connectrpc.shutdown-grace-period",
+      "type": "java.time.Duration",
+      "description": "How long calls in flight may run once the application context starts to close; then they end with unavailable. Defaults to 30 seconds, the time Spring Boot's graceful shutdown gives active requests (spring.lifecycle.timeout-per-shutdown-phase).",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": "30s"
+    },
+    {
+      "name": "connectrpc.handler-threads",
+      "type": "java.lang.Integer",
+      "description": "Largest number of calls whose handlers run at once when virtual threads are off; handlers may block. Defaults to Tomcat's default maxThreads.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": 200
+    },
+    {
+      "name": "connectrpc.path-prefix",
+      "type": "java.lang.String",
+      "description": "Path under which every registered service is mounted, for example /rpc serves acme.v1.FooService/Bar at /rpc/acme.v1.FooService/Bar. Empty mounts services at the root; many gRPC clients cannot send a path prefix.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties",
+      "defaultValue": ""
+    },
+    {
+      "name": "connectrpc.tomcat.http2-overhead-data-threshold",
+      "type": "java.lang.Integer",
+      "description": "overheadDataThreshold for Tomcat's HTTP/2 connector: the average non-final DATA frame size below which Tomcat counts frames as overhead and eventually closes the connection; zero or less disables that check. Unset keeps Tomcat's value, 1024 by default.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties$Tomcat"
+    },
+    {
+      "name": "connectrpc.tomcat.http2-overhead-reset-factor",
+      "type": "java.lang.Integer",
+      "description": "overheadResetFactor for Tomcat's HTTP/2 connector: how much each RST_STREAM received or sent adds to the connection's overhead count, which Tomcat closes the connection for once it exceeds zero; less than zero is treated as zero. Unset keeps Tomcat's value, 50 by default. Tomcat added this count as its fix for the HTTP/2 rapid reset attack, CVE-2023-44487, so a lower value lets a client open and reset more streams before Tomcat closes its connection.",
+      "sourceType": "com.connectrpc.server.springboot.ConnectRpcProperties$Tomcat"
+    }
+  ],
+  "hints": []
+}
