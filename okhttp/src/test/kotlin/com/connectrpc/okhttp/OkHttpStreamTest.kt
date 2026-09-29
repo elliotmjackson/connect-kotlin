@@ -18,6 +18,7 @@ import com.connectrpc.Code
 import com.connectrpc.ConnectException
 import com.connectrpc.ProtocolClientConfig
 import com.connectrpc.eliza.v1.ElizaServiceClient
+import com.connectrpc.eliza.v1.introduceRequest
 import com.connectrpc.extensions.GoogleJavaProtobufStrategy
 import com.connectrpc.impl.ProtocolClient
 import com.connectrpc.protocols.NetworkProtocol
@@ -51,27 +52,9 @@ class OkHttpStreamTest {
                 addHeader("content-type", "application/connect+proto")
             }.build(),
         )
-        val client = createStreamingClient()
-        runBlocking {
-            val stream = client.converse()
-            val exception = withTimeout(10.seconds) {
-                try {
-                    for (msg in stream.responseChannel()) {
-                        // Should not receive any messages.
-                    }
-                    null
-                } catch (e: ConnectException) {
-                    e
-                }
-            }
-            assertThat(exception).isNotNull()
-            // The exact code depends on protocol interceptor processing,
-            // but the key assertion is that the stream completes at all
-            // (before the fix, the response body was never closed on
-            // non-200 responses, causing a connection leak).
-            assertThat(exception!!.code).isIn(Code.UNAVAILABLE, Code.UNKNOWN, Code.INTERNAL_ERROR)
-            stream.receiveClose()
-        }
+        val exception = serverStreamError(NetworkProtocol.CONNECT)
+        assertThat(exception).isNotNull()
+        assertThat(exception!!.code).isEqualTo(Code.UNAVAILABLE)
     }
 
     // Verify that a 200 streaming response with an empty body also
@@ -84,24 +67,67 @@ class OkHttpStreamTest {
                 addHeader("content-type", "application/connect+proto")
             }.build(),
         )
-        val client = createStreamingClient()
-        runBlocking {
-            val stream = client.converse()
-            withTimeout(10.seconds) {
+        serverStreamError(NetworkProtocol.CONNECT)
+    }
+
+    // protocol.md "HTTP to Error Code" and http-grpc-status-mapping.md both
+    // map 403 to permission_denied when the response carries no RPC status.
+    @Test
+    fun `connect non-200 streaming response with foreign content-type infers code from status`() {
+        assertForbiddenStreamIsPermissionDenied(NetworkProtocol.CONNECT)
+    }
+
+    @Test
+    fun `grpc-web non-200 streaming response with foreign content-type infers code from status`() {
+        assertForbiddenStreamIsPermissionDenied(NetworkProtocol.GRPC_WEB)
+    }
+
+    @Test
+    fun `grpc non-200 streaming response with foreign content-type infers code from status`() {
+        assertForbiddenStreamIsPermissionDenied(NetworkProtocol.GRPC)
+    }
+
+    private fun assertForbiddenStreamIsPermissionDenied(networkProtocol: NetworkProtocol) {
+        mockWebServerRule.server.enqueue(
+            MockResponse.Builder().apply {
+                code(403)
+                addHeader("content-type", "application/json")
+                addHeader("x-denied-by", "filter")
+                body("""{"error":"forbidden"}""")
+            }.build(),
+        )
+        val exception = serverStreamError(networkProtocol)
+        assertThat(exception).isNotNull()
+        assertThat(exception!!.code).isEqualTo(Code.PERMISSION_DENIED)
+        assertThat(exception.metadata["x-denied-by"]).containsExactly("filter")
+    }
+
+    /**
+     * Runs a server-streaming call against the enqueued response and returns the
+     * error it ends with, if any. MockWebServer serves HTTP/1.1 here, which OkHttp
+     * cannot use for a duplex (bidi) call.
+     */
+    private fun serverStreamError(networkProtocol: NetworkProtocol): ConnectException? {
+        val client = createStreamingClient(networkProtocol)
+        return runBlocking {
+            val stream = client.introduce()
+            stream.sendAndClose(introduceRequest { name = "test" })
+            val exception = withTimeout(10.seconds) {
                 try {
                     for (msg in stream.responseChannel()) {
-                        // drain
+                        // Should not receive any messages.
                     }
-                } catch (_: ConnectException) {
-                    // May get an error from the protocol interceptor due to
-                    // unexpected content-type or missing end-of-stream.
+                    null
+                } catch (e: ConnectException) {
+                    e
                 }
             }
             stream.receiveClose()
+            exception
         }
     }
 
-    private fun createStreamingClient(): ElizaServiceClient {
+    private fun createStreamingClient(networkProtocol: NetworkProtocol): ElizaServiceClient {
         val host = mockWebServerRule.server.url("/")
         val okHttpClient = OkHttpClient.Builder()
             .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
@@ -111,7 +137,7 @@ class OkHttpStreamTest {
             ProtocolClientConfig(
                 host = host.toString(),
                 serializationStrategy = GoogleJavaProtobufStrategy(),
-                networkProtocol = NetworkProtocol.CONNECT,
+                networkProtocol = networkProtocol,
                 timeoutOracle = { null },
             ),
         )

@@ -50,6 +50,8 @@ import okio.Buffer
 import kotlin.concurrent.atomics.AtomicReference
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
 import kotlin.coroutines.resume
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 
 /**
  * Concrete implementation of the [ProtocolClientInterface].
@@ -95,6 +97,7 @@ class ProtocolClient(
                 message = requestMessage,
             )
             val unaryFunc = config.createInterceptorChain()
+            val deadline = requestTimeout?.let { TimeSource.Monotonic.markNow() + it }
             val finalRequest = unaryFunc.requestFunction(unaryRequest)
             val timeoutRef = AtomicReference<Timeout?>(null)
             val finalOnResult: (ResponseMessage<Output>) -> Unit = handleResult@{ result ->
@@ -103,7 +106,7 @@ class ProtocolClient(
                         val timeout = timeoutRef.load()
                         if (timeout != null) {
                             timeout.cancel()
-                            if (result.cause.code == Code.CANCELED && timeout.timedOut) {
+                            if (result.cause.code == Code.CANCELED && deadlineExceeded(timeout, deadline)) {
                                 onResult(
                                     ResponseMessage.Failure(
                                         cause = ConnectException(Code.DEADLINE_EXCEEDED, exception = result.cause),
@@ -256,6 +259,7 @@ class ProtocolClient(
             methodSpec = methodSpec,
         )
         val streamFunc = config.createStreamingInterceptorChain()
+        val deadline = requestTimeout?.let { TimeSource.Monotonic.markNow() + it }
         val finalRequest = streamFunc.requestFunction(request)
         val timeoutRef = AtomicReference<Timeout?>(null)
         var isComplete = false
@@ -297,7 +301,7 @@ class ProtocolClient(
                         val timeout = timeoutRef.load()
                         if (timeout != null) {
                             timeout.cancel()
-                            if (connEx.code == Code.CANCELED && timeout.timedOut) {
+                            if (connEx.code == Code.CANCELED && deadlineExceeded(timeout, deadline)) {
                                 connEx = ConnectException(Code.DEADLINE_EXCEEDED, exception = ex)
                             }
                         }
@@ -317,7 +321,7 @@ class ProtocolClient(
                     val timeout = timeoutRef.load()
                     if (timeout != null) {
                         timeout.cancel()
-                        if (connEx?.code == Code.CANCELED && timeout.timedOut) {
+                        if (connEx?.code == Code.CANCELED && deadlineExceeded(timeout, deadline)) {
                             connEx = ConnectException(Code.DEADLINE_EXCEEDED, exception = streamResult.cause)
                         }
                     }
@@ -362,4 +366,16 @@ class ProtocolClient(
     }
 
     private fun urlFromMethodSpec(methodSpec: MethodSpec<*, *>): Url = URLBuilder(baseUrlWithTrailingSlash).appendPathSegments(methodSpec.path).build()
+
+    /**
+     * Reports whether a cancellation happened at or after the RPC deadline. The
+     * deadline is marked before the interceptors write the timeout header, so a
+     * server cancelling on its own expiry of that timeout acts after it, even if
+     * the local timer has not fired yet. grpc-go servers reset such streams with
+     * RST_STREAM(CANCEL) (internal/transport/http2_server.go, operateHeaders),
+     * and grpc-go clients apply this rule (http2_client.go, handleRSTStream).
+     */
+    private fun deadlineExceeded(timeout: Timeout, deadline: TimeMark?): Boolean {
+        return timeout.timedOut || deadline?.hasPassedNow() == true
+    }
 }

@@ -246,7 +246,20 @@ internal class GRPCWebInterceptor(
                             StreamResult.Message(unpackedMessage)
                         }
                     },
-                    onCompletion = { result -> result },
+                    onCompletion = { result ->
+                        if (result.cause != null) {
+                            return@fold result
+                        }
+                        // The body ended without a trailers message. With no messages
+                        // either, this is a trailers-only response whose status and
+                        // metadata are in the headers (PROTOCOL-WEB.md, "Message
+                        // framing" item 4); otherwise the status is missing.
+                        val completion = completionParser.parse(responseHeaders, !streamEmpty, result.trailers)
+                        StreamResult.Complete(
+                            cause = completion.toConnectExceptionOrNull(serializationStrategy),
+                            trailers = if (completion.trailersOnly) responseHeaders else result.trailers,
+                        )
+                    },
                 )
                 streamResult
             },

@@ -38,6 +38,8 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import okhttp3.internal.http.HttpMethod
+import okhttp3.internal.http2.ErrorCode
+import okhttp3.internal.http2.StreamResetException
 import okio.Buffer
 import okio.BufferedSink
 import java.io.IOException
@@ -227,6 +229,9 @@ internal fun codeFromException(callCanceled: Boolean, e: Throwable): Code {
     ) {
         Code.DEADLINE_EXCEEDED
     } else if (e is IOException && callCanceled) {
+        Code.CANCELED
+    } else if (e is StreamResetException && e.errorCode == ErrorCode.CANCEL) {
+        // A server's RST_STREAM(CANCEL) maps to CANCELLED (PROTOCOL-HTTP2.md, "Errors").
         Code.CANCELED
     } else {
         Code.UNKNOWN
