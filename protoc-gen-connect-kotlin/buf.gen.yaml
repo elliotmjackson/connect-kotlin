@@ -6,6 +6,13 @@ plugins:
     opt:
       - generateCallbackMethods=true
       - generateCoroutineMethods=true
+      - generateServerHandler=true
+      # conformance/server compiles handlers without defaults.
+      - generateServerHandlerDefaults=true
   - protoc_builtin: java
     protoc_path: .tmp/bin/protoc
     out: build/generated/sources/bufgen
+inputs:
+  - directory: protoc-gen-connect-kotlin/proto
+  # Eliza, for the generated client and handler tests over InMemoryHTTPClient.
+  - module: buf.build/connectrpc/eliza

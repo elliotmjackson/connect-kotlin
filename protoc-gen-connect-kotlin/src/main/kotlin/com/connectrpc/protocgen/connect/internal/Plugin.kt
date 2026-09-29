@@ -247,5 +247,21 @@ object Plugin {
                 throw PluginException("Error writing to stdout.", e)
             }
         }
+
+        /**
+         * Reports that code generation failed. protoc prints [message] and
+         * fails; plugin.proto `CodeGeneratorResponse.error` is the channel for
+         * problems with the input, such as an invalid parameter.
+         *
+         * @param message The reason generation failed.
+         */
+        fun setError(message: String) {
+            try {
+                PluginProtos.CodeGeneratorResponse.newBuilder().setError(message).build().writeTo(output)
+                output.flush()
+            } catch (e: IOException) {
+                throw PluginException("Error writing to stdout.", e)
+            }
+        }
     }
 }
