@@ -109,6 +109,11 @@ is available on the [connectrpc.com website][getting-started].
 | `generateCallbackMethods`      | Boolean  |   `false`   | Generate callback signatures for unary methods. |
 | `generateCoroutineMethods`     | Boolean  |   `true`    | Generate suspend signatures for unary methods.  |
 | `generateBlockingUnaryMethods` | Boolean  |   `false`   | Generate blocking signatures for unary methods. |
+| `generateClient`               | Boolean  |   `true`    | Generate `<Service>ClientInterface` and `<Service>Client`. |
+| `generateServerHandler`        | Boolean  |   `false`   | Generate the `<Service>Handler` server interface (requires `connect-kotlin-server`). |
+| `generateServerHandlerDefaults` | Boolean |   `false`   | Give each `<Service>Handler` method a default body that throws `Code.UNIMPLEMENTED`, so adding an RPC to the schema does not break implementations. Without it, a missing method is a compile error. |
+
+Values must be `true` or `false`; an unknown option or any other value fails generation.
 
 ## Example Apps
 
@@ -131,6 +136,71 @@ The examples demonstrates:
 - Using the [Connect protocol][connect-protocol]
 - Using the [gRPC protocol][grpc-protocol]
 - Using the [gRPC-Web protocol][grpc-web-protocol]
+
+## Server
+
+Connect-Kotlin also serves the [Connect][connect-protocol], [gRPC][grpc-protocol],
+and [gRPC-Web][grpc-web-protocol] protocols. Pass `generateServerHandler=true`
+to `protoc-gen-connect-kotlin` to generate a `<Service>Handler` interface per service,
+implement it, and register its `handlers()` on a `HandlerRegistry`:
+
+```kotlin
+class ElizaServiceImpl : ElizaServiceHandler {
+    override suspend fun say(request: SayRequest, ctx: HandlerContext): SayResponse =
+        SayResponse.newBuilder().setSentence("You said: ${request.sentence}").build()
+    // ...
+}
+
+val registry = HandlerRegistry.builder()
+    .codec(GoogleJavaProtobufStrategy())
+    .codec(GoogleJavaJSONStrategy())
+    .registerAll(ElizaServiceImpl().handlers())
+    .build()
+```
+
+Serve the registry with one of the adapters:
+
+- [`server-ktor`](./server-ktor): call `connectRpc(registry)` in a Ktor application. With
+  Netty and HTTP/2 over cleartext (h2c) enabled, gRPC works without TLS too:
+
+  ```kotlin
+  embeddedServer(Netty, configure = {
+      connector { port = 8080 }
+      enableHttp2 = true
+      enableH2c = true
+  }) {
+      connectRpc(registry)
+  }.start(wait = true)
+  ```
+- [`server-springboot`](./server-springboot): declare the registry as a `@Bean`; Spring Boot 4.1, JDK 17.
+
+`server` holds the framework-independent runtime. Both adapters pass the
+[conformance suite][conformance] for all three protocols over HTTP/1.1 and HTTP/2
+(`make runserverconformance`, `make runserverconformance-springboot`).
+
+For browsers on another origin, configure the framework's CORS support from
+`ConnectCors`, which lists the methods and headers Connect and gRPC-Web need
+([CORS guide][cors]); for Ktor's `CORS` plugin:
+
+```kotlin
+install(CORS) {
+    allowHost("app.example.com", schemes = listOf("https"))
+    ConnectCors.allowedMethods.forEach { allowMethod(HttpMethod.parse(it)) }
+    ConnectCors.allowedHeaders.forEach(::allowHeader)
+    ConnectCors.exposedHeaders.forEach(::exposeHeader)
+}
+```
+
+To test handlers without a network, give a generated client an `InMemoryHTTPClient`,
+which hands each request to a `ConnectServer` in the same process over any protocol:
+
+```kotlin
+val client = ProtocolClient(
+    InMemoryHTTPClient(ConnectServer(registry)),
+    ProtocolClientConfig(host = "http://in-memory", serializationStrategy = GoogleJavaProtobufStrategy()),
+)
+val response = ElizaServiceClient(client).say(SayRequest.newBuilder().setSentence("hi").build())
+```
 
 ## Contributing
 
@@ -164,6 +234,7 @@ Offered under the [Apache 2 license][license].
 [connect-go]: https://github.com/connectrpc/connect-go
 [connect-protocol]: https://connectrpc.com/docs/protocol
 [connect-swift]: https://github.com/connectrpc/connect-swift
+[cors]: https://connectrpc.com/docs/cors
 [connect-es]: https://www.npmjs.com/package/@connectrpc/connect
 [error-handling]: https://connectrpc.com/docs/kotlin/errors
 [getting-started]: https://connectrpc.com/docs/kotlin/getting-started

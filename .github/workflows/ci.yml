@@ -131,3 +131,60 @@ jobs:
           setup_only: true
       - name: Run lint
         run: make lint
+  server-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache: false
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      # server-springboot compiles with jvmTarget 17 (build.gradle.kts).
+      - uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
+        with:
+          setup_only: true
+      - name: Run tests
+        run: make test
+  server-conformance:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [runserverconformance, runserverconformance-springboot]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
+        with:
+          setup_only: true
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache: false
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+      - name: Run server conformance tests
+        run: make ${{ matrix.target }}
