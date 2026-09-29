@@ -13,6 +13,7 @@ okhttp = "5.5.0"
 okio = "3.18.2"
 protobuf = "4.36.2"
 spotless = "8.10.2"
+springBoot = "4.1.0"
 
 [libraries]
 android = { module = "com.google.android:android", version.ref = "android" }
@@ -26,6 +27,7 @@ androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtim
 androidx-ktx = { module = "androidx.core:core-ktx", version = "1.19.1" }
 androidx-recyclerview = { module = "androidx.recyclerview:recyclerview", "version" = "1.4.0" }
 assertj = { module = "org.assertj:assertj-core", version.ref = "assertj" }
+jakarta-servlet-api = { module = "jakarta.servlet:jakarta.servlet-api", version = "6.1.0" }
 junit = { module = "junit:junit", version.ref = "junit" }
 kotlin-coroutines-android = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-android", version.ref = "coroutines" }
 kotlin-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
@@ -35,6 +37,9 @@ kotlin-reflect = { module = "org.jetbrains.kotlin:kotlin-reflect", version.ref =
 kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
 kotlinpoet = { module = "com.squareup:kotlinpoet", version.ref = "kotlinpoet" }
 ktor-http = { module = "io.ktor:ktor-http", version.ref = "ktor" }
+ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }
+ktor-server-cors = { module = "io.ktor:ktor-server-cors", version.ref = "ktor" }
+ktor-server-netty = { module = "io.ktor:ktor-server-netty", version.ref = "ktor" }
 maven-plugin = { module = "com.vanniktech:gradle-maven-publish-plugin", version.ref = "mavenplugin" }
 mockito = { module = "org.mockito.kotlin:mockito-kotlin", version = "4.1.0" }
 moshiKotlin = { module = "com.squareup.moshi:moshi-kotlin", version.ref = "moshi" }
@@ -49,6 +54,17 @@ protobuf-javalite = { module = "com.google.protobuf:protobuf-javalite", version.
 protobuf-kotlin = { module = "com.google.protobuf:protobuf-kotlin", version.ref = "protobuf" }
 protobuf-kotlinlite = { module = "com.google.protobuf:protobuf-kotlin-lite", version.ref = "protobuf" }
 spotless = { module = "com.diffplug.spotless:spotless-plugin-gradle", version.ref = "spotless" }
+slf4j-api = { module = "org.slf4j:slf4j-api" }
+spring-boot-autoconfigure = { module = "org.springframework.boot:spring-boot-autoconfigure", version.ref = "springBoot" }
+spring-boot-dependencies = { module = "org.springframework.boot:spring-boot-dependencies", version.ref = "springBoot" }
+spring-boot-starter-micrometer-metrics = { module = "org.springframework.boot:spring-boot-starter-micrometer-metrics", version.ref = "springBoot" }
+spring-boot-starter-tomcat = { module = "org.springframework.boot:spring-boot-starter-tomcat", version.ref = "springBoot" }
+spring-boot-starter-webmvc = { module = "org.springframework.boot:spring-boot-starter-webmvc", version.ref = "springBoot" }
+spring-boot-tomcat = { module = "org.springframework.boot:spring-boot-tomcat", version.ref = "springBoot" }
+spring-security-core = { module = "org.springframework.security:spring-security-core" }
+spring-security-web = { module = "org.springframework.security:spring-security-web" }
+spring-web = { module = "org.springframework:spring-web" }
+spring-webmvc = { module = "org.springframework:spring-webmvc" }
 
 [plugins]
 dokka = { id = "org.jetbrains.dokka", version.ref = "dokka" }

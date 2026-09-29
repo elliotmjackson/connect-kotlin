@@ -23,6 +23,7 @@ sourceSets {
 dependencies {
     testImplementation(libs.assertj)
     testImplementation(libs.junit)
+    testImplementation(project(":server"))
 
     implementation(project(":okhttp"))
     api(libs.okio.core)
