@@ -10,7 +10,9 @@ BIN := .tmp/bin
 CACHE := .tmp/cache
 LICENSE_HEADER_YEAR_RANGE := 2022-2026
 LICENSE_HEADER_VERSION := v1.66.1
-CONFORMANCE_VERSION := v1.0.3
+CONFORMANCE_VERSION := v1.0.5
+# The BSR module has no v1.0.5 label; its protos are identical to v1.0.4.
+CONFORMANCE_PROTO_VERSION := v1.0.4
 PROTOC_VERSION ?= $(shell yq '.versions.protobuf' gradle/libs.versions.toml | cut -d'.' -f2-)
 ifeq ($(PROTOC_VERSION),)
 $(error "Unable to determine protoc version")
@@ -76,6 +78,12 @@ runconformance: generate $(CONNECT_CONFORMANCE)
 		--known-failing @conformance/client/known-failing-stream-cases.txt -- \
 		conformance/client/google-java/build/install/google-java/bin/google-java
 
+.PHONY: runserverconformance
+runserverconformance: generate $(CONNECT_CONFORMANCE) ## Run conformance tests against the Kotlin server.
+	./gradlew $(GRADLE_ARGS) conformance:server:installDist
+	$(CONNECT_CONFORMANCE) -v --mode server --conf conformance/server/server-config.yaml -- \
+		conformance/server/build/install/server/bin/server
+
 ifeq ($(UNAME_OS),Darwin)
 PROTOC_OS := osx
 ifeq ($(UNAME_ARCH),arm64)
@@ -132,7 +140,9 @@ generate: $(PROTOC) buildplugin generateconformance generateexamples ## Generate
 generateconformance: $(PROTOC) buildplugin ## Generate protofiles for conformance tests.
 	rm -rf conformance/client/google-java/build/generated/sources/bufgen || true
 	rm -rf conformance/client/google-javalite/build/generated/sources/bufgen || true
-	buf generate --template conformance/buf.gen.yaml -o conformance/client buf.build/connectrpc/conformance:$(CONFORMANCE_VERSION)
+	buf generate --template conformance/buf.gen.yaml -o conformance/client buf.build/connectrpc/conformance:$(CONFORMANCE_PROTO_VERSION)
+	rm -rf conformance/server/build/generated/sources/bufgen || true
+	buf generate --template conformance/server/buf.gen.yaml -o conformance buf.build/connectrpc/conformance:$(CONFORMANCE_PROTO_VERSION)
 
 .PHONY: generateexamples
 generateexamples: $(PROTOC) buildplugin ## Generate proto files for example apps.
@@ -174,5 +184,5 @@ releaselocal: ## Release artifacts to local maven repository.
 	./gradlew $(GRADLE_ARGS) --info publishToMavenLocal
 
 .PHONY: test
-test: generate ## Run tests for the library.
-	./gradlew $(GRADLE_ARGS) library:test
+test: generate ## Run tests for the library, its extensions, the code generator and the server modules.
+	./gradlew $(GRADLE_ARGS) library:test okhttp:test extensions:google-java:test extensions:google-javalite:test protoc-gen-connect-kotlin:test server:test server-ktor:test

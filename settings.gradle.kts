@@ -3,6 +3,7 @@ rootProject.name = "connect-kotlin"
 include(":conformance:client")
 include(":conformance:client:google-java")
 include(":conformance:client:google-javalite")
+include(":conformance:server")
 if (extra.has("skipAndroid") && extra.get("skipAndroid").toString().toBoolean()) {
     println("Skipping Android build (skipAndroid=true)")
 } else {
@@ -18,3 +19,4 @@ include(":library")
 include(":okhttp")
 include(":protoc-gen-connect-kotlin")
 include(":server")
+include(":server-ktor")
